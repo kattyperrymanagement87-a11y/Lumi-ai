@@ -1,5 +1,6 @@
 import os
 import logging
+from datetime import datetime
 
 from telegram import Update
 from telegram.ext import (
@@ -10,118 +11,337 @@ from telegram.ext import (
     filters
 )
 
+# -----------------------------
+# LOGGING
+# -----------------------------
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
+logger = logging.getLogger(__name__)
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 
+# -----------------------------
+# LUMI CORE
+# -----------------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
     await update.message.reply_text(
-        "✨ Hello! I am Lumi AI.\n\n"
-        "🧠 Your intelligent assistant is online and ready.\n"
-        "📊 I am being developed to assist with XAUUSD market monitoring, "
-        "structured analysis and alerts.\n\n"
-        "Use /help to see my available commands."
+        f"✨ Welcome, {user.first_name}.\n\n"
+        "I am Lumi AI 🧠\n"
+        "Your intelligent assistant is online.\n\n"
+        "I am currently evolving with capabilities for:\n"
+        "📊 Market intelligence\n"
+        "🟡 XAUUSD monitoring\n"
+        "📈 Structured market analysis\n"
+        "🔔 Alert systems\n"
+        "💬 Intelligent conversation\n\n"
+        "Use /help to explore my systems."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 LUMI AI COMMANDS\n\n"
+        "🤖 LUMI AI COMMAND CENTER\n\n"
+        
+        "🧠 CORE\n"
         "/start - Start Lumi\n"
-        "/help - Show available commands\n"
-        "/status - Check Lumi's system status\n"
-        "/gold - Open XAUUSD section\n\n"
-        "💬 You can also talk to me normally!"
+        "/help - View commands\n"
+        "/status - System status\n"
+        "/about - About Lumi\n\n"
+
+        "📊 MARKET INTELLIGENCE\n"
+        "/gold - XAUUSD center\n"
+        "/market - Market intelligence\n"
+        "/analyze - Analysis center\n"
+        "/news - Market news center\n\n"
+
+        "💬 You can also talk to me naturally.\n\n"
+        "Example:\n"
+        "• What do you think about gold?\n"
+        "• Are you online?\n"
+        "• What can you do?"
     )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🟢 SYSTEM STATUS\n\n"
-        "Lumi AI: Online\n"
-        "Telegram Connection: Active\n"
-        "Core System: Running\n"
-        "Market Intelligence: Under Development"
+        "🟢 LUMI SYSTEM STATUS\n\n"
+        "AI Core: Online 🧠\n"
+        "Telegram Connection: Active 📡\n"
+        "Conversation System: Active 💬\n"
+        "Command Center: Online ⚙️\n"
+        "Market Intelligence: Developing 📊\n"
+        "Alert Engine: Planned 🔔\n\n"
+        "Status: Stable"
     )
 
+
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✨ ABOUT LUMI AI\n\n"
+        "Lumi is an evolving intelligent assistant designed to combine "
+        "conversation, automation and market intelligence.\n\n"
+        "Current focus:\n"
+        "• Telegram intelligence\n"
+        "• XAUUSD observation\n"
+        "• Structured analysis\n"
+        "• Market alerts\n\n"
+        "Lumi does not guarantee profits or financial outcomes. "
+        "Market analysis should always be independently verified."
+    )
+
+
+# -----------------------------
+# MARKET COMMANDS
+# -----------------------------
 
 async def gold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🟡 XAUUSD / GOLD CENTER\n\n"
-        "📊 Market intelligence module is being developed.\n\n"
-        "Future capabilities:\n"
+        "Welcome to Lumi's Gold Intelligence Center.\n\n"
+        "Current development modules:\n"
         "• Market bias\n"
+        "• Trend detection\n"
+        "• Support & resistance\n"
         "• Price monitoring\n"
         "• Structured analysis\n"
         "• Alert conditions\n\n"
-        "⚠️ Lumi will present analysis and alerts, not guaranteed profits."
+        "⚠️ Live market data integration is the next stage.\n\n"
+        "Lumi provides analysis and observations — not guaranteed profits."
     )
 
 
+async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📊 MARKET INTELLIGENCE CENTER\n\n"
+        "Lumi is preparing her market observation system.\n\n"
+        "Future intelligence flow:\n\n"
+        "1️⃣ Detect market conditions\n"
+        "2️⃣ Identify trend direction\n"
+        "3️⃣ Locate important zones\n"
+        "4️⃣ Monitor volatility\n"
+        "5️⃣ Generate structured observations\n"
+        "6️⃣ Trigger alert conditions\n\n"
+        "Live data connection: Coming next."
+    )
+
+
+async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔍 ANALYSIS CENTER\n\n"
+        "Lumi's future structured analysis format:\n\n"
+        "📈 Market Bias\n"
+        "📊 Trend Structure\n"
+        "🟢 Bullish Factors\n"
+        "🔴 Bearish Factors\n"
+        "🎯 Key Price Zones\n"
+        "⚠️ Risk Conditions\n"
+        "🧠 Confidence Assessment\n\n"
+        "Live analysis requires a market-data source, "
+        "which will be connected in the next development phase."
+    )
+
+
+async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📰 MARKET NEWS CENTER\n\n"
+        "Lumi's news intelligence module is under development.\n\n"
+        "Future capabilities:\n"
+        "• Economic event monitoring\n"
+        "• Market-moving news\n"
+        "• Gold-related developments\n"
+        "• Sentiment observations\n\n"
+        "Live news integration will be added soon."
+    )
+
+
+# -----------------------------
+# NATURAL CONVERSATION
+# -----------------------------
+
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message.text.lower()
 
-    if any(word in message for word in ["hello", "hi", "hey"]):
+    message = update.message.text.lower().strip()
+    user = update.effective_user.first_name
+
+    # Greetings
+    if any(word in message for word in [
+        "hello", "hi", "hey", "good morning",
+        "good afternoon", "good evening"
+    ]):
+
         reply = (
-            "Hello ❤️ I'm Lumi.\n\n"
-            "I'm online and ready to assist you. "
-            "You can ask me about my status or use /help to explore my commands."
+            f"Hello {user} ❤️\n\n"
+            "Lumi is online and ready.\n\n"
+            "You can talk to me normally or use /help "
+            "to explore my current systems."
         )
 
-    elif "how are you" in message:
-        reply = (
-            "I'm doing great 😄🧠\n\n"
-            "My systems are online and I'm ready to work."
-        )
+    # Identity
+    elif any(phrase in message for phrase in [
+        "who are you",
+        "what are you",
+        "tell me about yourself"
+    ]):
 
-    elif any(phrase in message for phrase in ["who are you", "what are you"]):
         reply = (
             "I'm Lumi AI ✨🧠\n\n"
-            "I'm an intelligent assistant currently being developed with "
-            "Telegram communication and XAUUSD market-monitoring capabilities."
+            "An evolving intelligent assistant designed for "
+            "conversation, automation and market intelligence.\n\n"
+            "My systems are continuously expanding."
         )
 
-    elif "gold" in message or "xauusd" in message:
+    # Health / status
+    elif any(phrase in message for phrase in [
+        "how are you",
+        "are you okay",
+        "are you online",
+        "are you working"
+    ]):
+
+        reply = (
+            "I'm doing great 😄🧠\n\n"
+            "My core systems are online and "
+            "I'm ready to work."
+        )
+
+    # Capabilities
+    elif any(phrase in message for phrase in [
+        "what can you do",
+        "your capabilities",
+        "help me"
+    ]):
+
+        reply = (
+            "I'm currently developing several capabilities 🧠\n\n"
+            "💬 Intelligent conversation\n"
+            "📊 Market intelligence\n"
+            "🟡 XAUUSD monitoring\n"
+            "📈 Structured analysis\n"
+            "🔔 Alert systems\n\n"
+            "Use /help to explore my command center."
+        )
+
+    # Gold
+    elif any(word in message for word in [
+        "gold",
+        "xauusd",
+        "xau",
+        "gold market"
+    ]):
+
         reply = (
             "🟡 XAUUSD detected.\n\n"
-            "My market intelligence system is currently being expanded. "
-            "Soon I'll be able to provide structured market observations and alerts."
+            "My Gold Intelligence system is being expanded.\n\n"
+            "Soon I will combine market data with structured "
+            "analysis to provide observations such as trend, "
+            "bias, important zones and alert conditions.\n\n"
+            "⚠️ I will not present market predictions as guaranteed profits."
         )
 
-    elif "thank" in message:
-        reply = "You're always welcome ❤️ I'm here with you."
+    # Trading
+    elif any(word in message for word in [
+        "trade",
+        "trading",
+        "forex",
+        "market"
+    ]):
 
-    else:
         reply = (
-            "I'm still learning and expanding my capabilities 🧠✨\n\n"
-            "Try /help to see what I can currently do."
+            "📊 I detected a market-related question.\n\n"
+            "My market intelligence infrastructure is currently "
+            "being developed.\n\n"
+            "The next upgrade will connect me to real market "
+            "information so I can provide data-based observations."
+        )
+
+    # Thanks
+    elif any(word in message for word in [
+        "thank",
+        "thanks"
+    ]):
+
+        reply = (
+            "You're always welcome ❤️\n\n"
+            "I'm here with you. Lumi keeps evolving."
+        )
+
+    # Creator / development
+    elif any(phrase in message for phrase in [
+        "who created you",
+        "who made you"
+    ]):
+
+        reply = (
+            "I am Lumi AI 🧠✨\n\n"
+            "I am an evolving project being developed to grow "
+            "into an intelligent assistant for communication, "
+            "automation and market intelligence."
+        )
+
+    # Default
+    else:
+
+        reply = (
+            "🧠 I'm processing your message.\n\n"
+            "My conversational intelligence is still evolving, "
+            "but my systems are expanding continuously.\n\n"
+            "Try asking me about:\n"
+            "• Myself\n"
+            "• My capabilities\n"
+            "• Gold / XAUUSD\n"
+            "• Market intelligence\n\n"
+            "Or use /help."
         )
 
     await update.message.reply_text(reply)
 
 
+# -----------------------------
+# MAIN SYSTEM
+# -----------------------------
+
 def main():
+
     if not TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
+        raise ValueError(
+            "TELEGRAM_BOT_TOKEN is not set"
+        )
+
+    logger.info("Initializing Lumi AI...")
 
     app = Application.builder().token(TOKEN).build()
 
-    # Commands
+    # Core commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("gold", gold))
+    app.add_handler(CommandHandler("about", about))
 
-    # Normal conversation
+    # Market commands
+    app.add_handler(CommandHandler("gold", gold))
+    app.add_handler(CommandHandler("market", market))
+    app.add_handler(CommandHandler("analyze", analyze))
+    app.add_handler(CommandHandler("news", news))
+
+    # Natural conversation
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, chat)
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            chat
+        )
     )
 
-    print("Lumi AI is starting...")
+    logger.info("Lumi AI is online.")
+    logger.info("Starting Telegram polling...")
+
     app.run_polling()
 
 
