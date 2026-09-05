@@ -1,6 +1,10 @@
 import os
 import logging
-from datetime import datetime
+import math
+import urllib.request
+import urllib.parse
+import json
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.ext import (
@@ -8,341 +12,732 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    filters
+    filters,
 )
 
-# -----------------------------
-# LOGGING
-# -----------------------------
+# ============================================================
+# LUMI AI — PRODUCTION FOUNDATION
+# Telegram + XAUUSD Structural Intelligence
+# ============================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("LumiAI")
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# Yahoo Finance chart endpoint.
+# XAUUSD=X is used as the spot-gold reference symbol.
+MARKET_SYMBOL = "XAUUSD=X"
+MARKET_URL = (
+    "https://query1.finance.yahoo.com/v8/finance/chart/"
+    + urllib.parse.quote(MARKET_SYMBOL)
+)
 
-# -----------------------------
-# LUMI CORE
-# -----------------------------
+DATA_INTERVAL = "1h"
+DATA_RANGE = "1mo"
+
+
+# ============================================================
+# BASIC MATH
+# ============================================================
+
+def mean(values):
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def ema(values, period):
+    if len(values) < period:
+        return None
+
+    multiplier = 2 / (period + 1)
+
+    current = mean(values[:period])
+
+    for price in values[period:]:
+        current = ((price - current) * multiplier) + current
+
+    return current
+
+
+def rsi(values, period=14):
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
+
+    avg_gain = mean(gains[:period])
+    avg_loss = mean(losses[:period])
+
+    for i in range(period, len(gains)):
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+
+    return 100 - (100 / (1 + rs))
+
+
+def atr(highs, lows, closes, period=14):
+    if len(closes) < period + 1:
+        return None
+
+    true_ranges = []
+
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+
+        true_ranges.append(tr)
+
+    if len(true_ranges) < period:
+        return None
+
+    value = mean(true_ranges[:period])
+
+    for tr in true_ranges[period:]:
+        value = ((value * (period - 1)) + tr) / period
+
+    return value
+
+
+# ============================================================
+# MARKET DATA
+# ============================================================
+
+def fetch_market_data():
+    params = urllib.parse.urlencode(
+        {
+            "interval": DATA_INTERVAL,
+            "range": DATA_RANGE,
+        }
+    )
+
+    url = f"{MARKET_URL}?{params}"
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
+    )
+
+    with urllib.request.urlopen(request, timeout=15) as response:
+        raw = response.read().decode("utf-8")
+
+    payload = json.loads(raw)
+
+    result = payload["chart"]["result"]
+
+    if not result:
+        raise RuntimeError("Market data provider returned no result.")
+
+    chart = result[0]
+
+    timestamps = chart.get("timestamp", [])
+    quote = chart["indicators"]["quote"][0]
+
+    opens = quote.get("open", [])
+    highs = quote.get("high", [])
+    lows = quote.get("low", [])
+    closes = quote.get("close", [])
+
+    rows = []
+
+    for i in range(len(timestamps)):
+        if (
+            i < len(opens)
+            and i < len(highs)
+            and i < len(lows)
+            and i < len(closes)
+            and opens[i] is not None
+            and highs[i] is not None
+            and lows[i] is not None
+            and closes[i] is not None
+        ):
+            rows.append(
+                {
+                    "time": timestamps[i],
+                    "open": float(opens[i]),
+                    "high": float(highs[i]),
+                    "low": float(lows[i]),
+                    "close": float(closes[i]),
+                }
+            )
+
+    if len(rows) < 60:
+        raise RuntimeError(
+            f"Not enough market candles received: {len(rows)}"
+        )
+
+    return rows
+
+
+# ============================================================
+# MARKET STRUCTURE
+# ============================================================
+
+def detect_structure(highs, lows):
+    """
+    Simple swing-structure model.
+
+    Uses recent swing highs/lows to classify:
+    - Bullish
+    - Bearish
+    - Neutral
+    """
+
+    if len(highs) < 20 or len(lows) < 20:
+        return "Neutral"
+
+    recent_highs = highs[-20:]
+    recent_lows = lows[-20:]
+
+    first_half_high = max(recent_highs[:10])
+    second_half_high = max(recent_highs[10:])
+
+    first_half_low = min(recent_lows[:10])
+    second_half_low = min(recent_lows[10:])
+
+    higher_high = second_half_high > first_half_high
+    higher_low = second_half_low > first_half_low
+
+    lower_high = second_half_high < first_half_high
+    lower_low = second_half_low < first_half_low
+
+    if higher_high and higher_low:
+        return "Bullish"
+
+    if lower_high and lower_low:
+        return "Bearish"
+
+    return "Neutral"
+
+
+# ============================================================
+# SUPPORT / RESISTANCE
+# ============================================================
+
+def calculate_levels(highs, lows, closes):
+    window = min(48, len(closes))
+
+    recent_highs = highs[-window:]
+    recent_lows = lows[-window:]
+    current_price = closes[-1]
+
+    resistance = max(recent_highs)
+    support = min(recent_lows)
+
+    # Additional nearby levels using shorter windows.
+    short_window = min(12, len(closes))
+
+    short_resistance = max(highs[-short_window:])
+    short_support = min(lows[-short_window:])
+
+    levels = {
+        "major_support": support,
+        "major_resistance": resistance,
+        "near_support": short_support,
+        "near_resistance": short_resistance,
+        "price": current_price,
+    }
+
+    return levels
+
+
+# ============================================================
+# MARKET INTELLIGENCE ENGINE
+# ============================================================
+
+def analyze_market(rows):
+    closes = [x["close"] for x in rows]
+    highs = [x["high"] for x in rows]
+    lows = [x["low"] for x in rows]
+
+    price = closes[-1]
+
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
+    rsi14 = rsi(closes, 14)
+    atr14 = atr(highs, lows, closes, 14)
+
+    structure = detect_structure(highs, lows)
+
+    levels = calculate_levels(highs, lows, closes)
+
+    score = 50
+    evidence = []
+
+    # --------------------------------------------------------
+    # STRUCTURE
+    # --------------------------------------------------------
+
+    if structure == "Bullish":
+        score += 15
+        evidence.append("Higher-timeframe structure is bullish.")
+
+    elif structure == "Bearish":
+        score -= 15
+        evidence.append("Recent market structure is bearish.")
+
+    else:
+        evidence.append("Market structure is mixed/unclear.")
+
+    # --------------------------------------------------------
+    # EMA TREND
+    # --------------------------------------------------------
+
+    if ema20 and ema50:
+
+        if ema20 > ema50:
+            score += 15
+            evidence.append("EMA20 is above EMA50.")
+
+        elif ema20 < ema50:
+            score -= 15
+            evidence.append("EMA20 is below EMA50.")
+
+        if price > ema20:
+            score += 5
+            evidence.append("Price is above EMA20.")
+
+        else:
+            score -= 5
+            evidence.append("Price is below EMA20.")
+
+    # --------------------------------------------------------
+    # RSI MOMENTUM
+    # --------------------------------------------------------
+
+    if rsi14 is not None:
+
+        if 50 <= rsi14 <= 68:
+            score += 8
+            evidence.append("RSI supports bullish momentum.")
+
+        elif 32 <= rsi14 < 50:
+            score -= 8
+            evidence.append("RSI supports bearish momentum.")
+
+        elif rsi14 > 70:
+            evidence.append(
+                "RSI is overbought; upside momentum may be extended."
+            )
+
+        elif rsi14 < 30:
+            evidence.append(
+                "RSI is oversold; downside momentum may be extended."
+            )
+
+    # --------------------------------------------------------
+    # SUPPORT / RESISTANCE LOCATION
+    # --------------------------------------------------------
+
+    support = levels["major_support"]
+    resistance = levels["major_resistance"]
+
+    range_size = resistance - support
+
+    if range_size > 0:
+
+        position = (price - support) / range_size
+
+        if position < 0.30:
+            score += 5
+            evidence.append("Price is positioned relatively close to support.")
+
+        elif position > 0.70:
+            score -= 5
+            evidence.append(
+                "Price is positioned relatively close to resistance."
+            )
+
+    # --------------------------------------------------------
+    # FINAL SCORE
+    # --------------------------------------------------------
+
+    score = max(0, min(100, round(score)))
+
+    if score >= 70:
+        bias = "BULLISH"
+        strength = "HIGH"
+
+    elif score >= 58:
+        bias = "BULLISH"
+        strength = "MODERATE"
+
+    elif score <= 30:
+        bias = "BEARISH"
+        strength = "HIGH"
+
+    elif score <= 42:
+        bias = "BEARISH"
+        strength = "MODERATE"
+
+    else:
+        bias = "NEUTRAL"
+        strength = "LOW"
+
+    # --------------------------------------------------------
+    # SCENARIO LEVELS
+    # --------------------------------------------------------
+
+    buy_trigger = None
+    sell_trigger = None
+    invalidation = None
+    target_1 = None
+    target_2 = None
+
+    if atr14:
+
+        if bias == "BULLISH":
+
+            buy_trigger = max(price, levels["near_resistance"])
+
+            invalidation = buy_trigger - (atr14 * 1.2)
+
+            target_1 = buy_trigger + (atr14 * 1.5)
+            target_2 = buy_trigger + (atr14 * 2.5)
+
+        elif bias == "BEARISH":
+
+            sell_trigger = min(price, levels["near_support"])
+
+            invalidation = sell_trigger + (atr14 * 1.2)
+
+            target_1 = sell_trigger - (atr14 * 1.5)
+            target_2 = sell_trigger - (atr14 * 2.5)
+
+    return {
+        "price": price,
+        "ema20": ema20,
+        "ema50": ema50,
+        "rsi": rsi14,
+        "atr": atr14,
+        "structure": structure,
+        "support": support,
+        "resistance": resistance,
+        "bias": bias,
+        "strength": strength,
+        "score": score,
+        "evidence": evidence,
+        "buy_trigger": buy_trigger,
+        "sell_trigger": sell_trigger,
+        "invalidation": invalidation,
+        "target_1": target_1,
+        "target_2": target_2,
+    }
+
+
+# ============================================================
+# FORMATTING
+# ============================================================
+
+def money(value):
+    if value is None:
+        return "N/A"
+
+    return f"{value:,.2f}"
+
+
+def build_market_report():
+
+    rows = fetch_market_data()
+
+    analysis = analyze_market(rows)
+
+    now = datetime.now(timezone.utc)
+
+    lines = [
+        "🟡 LUMI XAUUSD INTELLIGENCE",
+        "",
+        f"💰 Price: {money(analysis['price'])}",
+        f"🧭 Bias: {analysis['bias']}",
+        f"📊 Structural Score: {analysis['score']}/100",
+        f"🎯 Signal Strength: {analysis['strength']}",
+        "",
+        "🏗 MARKET STRUCTURE",
+        f"• Structure: {analysis['structure']}",
+        f"• EMA20: {money(analysis['ema20'])}",
+        f"• EMA50: {money(analysis['ema50'])}",
+        "",
+        "📈 MOMENTUM",
+        f"• RSI(14): {money(analysis['rsi'])}",
+        f"• ATR(14): {money(analysis['atr'])}",
+        "",
+        "🎯 KEY LEVELS",
+        f"• Support: {money(analysis['support'])}",
+        f"• Resistance: {money(analysis['resistance'])}",
+        "",
+        "🧠 STRUCTURAL EVIDENCE",
+    ]
+
+    for item in analysis["evidence"]:
+        lines.append(f"• {item}")
+
+    lines.extend(
+        [
+            "",
+            "📌 TRADE SCENARIO",
+        ]
+    )
+
+    if analysis["bias"] == "BULLISH":
+
+        lines.extend(
+            [
+                f"• Confirmation area: {money(analysis['buy_trigger'])}",
+                f"• Invalidation: {money(analysis['invalidation'])}",
+                f"• Scenario target 1: {money(analysis['target_1'])}",
+                f"• Scenario target 2: {money(analysis['target_2'])}",
+                "",
+                "🟢 Preferred direction: BUY AFTER CONFIRMATION",
+            ]
+        )
+
+    elif analysis["bias"] == "BEARISH":
+
+        lines.extend(
+            [
+                f"• Confirmation area: {money(analysis['sell_trigger'])}",
+                f"• Invalidation: {money(analysis['invalidation'])}",
+                f"• Scenario target 1: {money(analysis['target_1'])}",
+                f"• Scenario target 2: {money(analysis['target_2'])}",
+                "",
+                "🔴 Preferred direction: SELL AFTER CONFIRMATION",
+            ]
+        )
+
+    else:
+
+        lines.extend(
+            [
+                "• No strong directional setup confirmed.",
+                "• Wait for structure and momentum alignment.",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            f"🕐 Data checked: {now.strftime('%Y-%m-%d %H:%M UTC')}",
+            "📡 Reference: XAUUSD=X market feed",
+            "",
+            "⚠️ Lumi's score is a technical model score, NOT a guaranteed probability of profit.",
+            "⚠️ Always manage risk. Market conditions can change rapidly.",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
 
     await update.message.reply_text(
-        f"✨ Welcome, {user.first_name}.\n\n"
-        "I am Lumi AI 🧠\n"
-        "Your intelligent assistant is online.\n\n"
-        "I am currently evolving with capabilities for:\n"
-        "📊 Market intelligence\n"
-        "🟡 XAUUSD monitoring\n"
-        "📈 Structured market analysis\n"
-        "🔔 Alert systems\n"
-        "💬 Intelligent conversation\n\n"
-        "Use /help to explore my systems."
+        "✨ Hello! I am Lumi AI.\n\n"
+        "🧠 Your intelligent assistant is online.\n"
+        "🟡 My XAUUSD structural intelligence system is active.\n\n"
+        "Use /help to see my commands."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     await update.message.reply_text(
-        "🤖 LUMI AI COMMAND CENTER\n\n"
-        
-        "🧠 CORE\n"
+        "🤖 LUMI AI COMMANDS\n\n"
         "/start - Start Lumi\n"
-        "/help - View commands\n"
+        "/help - Show commands\n"
         "/status - System status\n"
+        "/gold - XAUUSD intelligence\n"
+        "/market - Market analysis\n"
+        "/analyze - Full XAUUSD analysis\n"
         "/about - About Lumi\n\n"
-
-        "📊 MARKET INTELLIGENCE\n"
-        "/gold - XAUUSD center\n"
-        "/market - Market intelligence\n"
-        "/analyze - Analysis center\n"
-        "/news - Market news center\n\n"
-
-        "💬 You can also talk to me naturally.\n\n"
-        "Example:\n"
-        "• What do you think about gold?\n"
-        "• Are you online?\n"
-        "• What can you do?"
+        "💬 You can also talk to me normally."
     )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     await update.message.reply_text(
         "🟢 LUMI SYSTEM STATUS\n\n"
-        "AI Core: Online 🧠\n"
-        "Telegram Connection: Active 📡\n"
-        "Conversation System: Active 💬\n"
-        "Command Center: Online ⚙️\n"
-        "Market Intelligence: Developing 📊\n"
-        "Alert Engine: Planned 🔔\n\n"
-        "Status: Stable"
+        "Lumi AI: Online\n"
+        "Telegram: Connected\n"
+        "XAUUSD Engine: Active\n"
+        "Structural Analysis: Active\n"
+        "EMA Analysis: Active\n"
+        "RSI Analysis: Active\n"
+        "Support/Resistance: Active\n"
+        "Risk Framework: Active\n\n"
+        "📡 Live market data is requested when analysis is run."
     )
 
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     await update.message.reply_text(
-        "✨ ABOUT LUMI AI\n\n"
-        "Lumi is an evolving intelligent assistant designed to combine "
-        "conversation, automation and market intelligence.\n\n"
-        "Current focus:\n"
-        "• Telegram intelligence\n"
-        "• XAUUSD observation\n"
-        "• Structured analysis\n"
-        "• Market alerts\n\n"
-        "Lumi does not guarantee profits or financial outcomes. "
-        "Market analysis should always be independently verified."
+        "🧠 ABOUT LUMI AI\n\n"
+        "Lumi is an AI assistant designed to combine "
+        "conversation with structured market intelligence.\n\n"
+        "Her analysis is based on measurable market information "
+        "rather than random predictions.\n\n"
+        "⚠️ Market analysis is probabilistic and never guaranteed."
     )
 
-
-# -----------------------------
-# MARKET COMMANDS
-# -----------------------------
 
 async def gold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     await update.message.reply_text(
-        "🟡 XAUUSD / GOLD CENTER\n\n"
-        "Welcome to Lumi's Gold Intelligence Center.\n\n"
-        "Current development modules:\n"
-        "• Market bias\n"
-        "• Trend detection\n"
-        "• Support & resistance\n"
-        "• Price monitoring\n"
-        "• Structured analysis\n"
-        "• Alert conditions\n\n"
-        "⚠️ Live market data integration is the next stage.\n\n"
-        "Lumi provides analysis and observations — not guaranteed profits."
+        "🟡 Lumi is analyzing XAUUSD...\n\n"
+        "Checking price, structure, trend, momentum and key levels."
     )
+
+    try:
+
+        report = build_market_report()
+
+        await update.message.reply_text(report)
+
+    except Exception as exc:
+
+        logger.exception("Gold analysis failed")
+
+        await update.message.reply_text(
+            "⚠️ Lumi could not retrieve reliable XAUUSD data right now.\n\n"
+            "No market signal will be invented.\n\n"
+            f"System detail: {str(exc)[:180]}"
+        )
 
 
 async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📊 MARKET INTELLIGENCE CENTER\n\n"
-        "Lumi is preparing her market observation system.\n\n"
-        "Future intelligence flow:\n\n"
-        "1️⃣ Detect market conditions\n"
-        "2️⃣ Identify trend direction\n"
-        "3️⃣ Locate important zones\n"
-        "4️⃣ Monitor volatility\n"
-        "5️⃣ Generate structured observations\n"
-        "6️⃣ Trigger alert conditions\n\n"
-        "Live data connection: Coming next."
-    )
+
+    await gold(update, context)
 
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🔍 ANALYSIS CENTER\n\n"
-        "Lumi's future structured analysis format:\n\n"
-        "📈 Market Bias\n"
-        "📊 Trend Structure\n"
-        "🟢 Bullish Factors\n"
-        "🔴 Bearish Factors\n"
-        "🎯 Key Price Zones\n"
-        "⚠️ Risk Conditions\n"
-        "🧠 Confidence Assessment\n\n"
-        "Live analysis requires a market-data source, "
-        "which will be connected in the next development phase."
-    )
+
+    await gold(update, context)
 
 
-async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📰 MARKET NEWS CENTER\n\n"
-        "Lumi's news intelligence module is under development.\n\n"
-        "Future capabilities:\n"
-        "• Economic event monitoring\n"
-        "• Market-moving news\n"
-        "• Gold-related developments\n"
-        "• Sentiment observations\n\n"
-        "Live news integration will be added soon."
-    )
-
-
-# -----------------------------
-# NATURAL CONVERSATION
-# -----------------------------
+# ============================================================
+# NATURAL LANGUAGE
+# ============================================================
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    message = update.message.text.lower().strip()
-    user = update.effective_user.first_name
+    text = (update.message.text or "").lower().strip()
 
-    # Greetings
-    if any(word in message for word in [
-        "hello", "hi", "hey", "good morning",
-        "good afternoon", "good evening"
-    ]):
+    if any(word in text for word in ["hello", "hi", "hey", "good morning", "good evening"]):
 
-        reply = (
-            f"Hello {user} ❤️\n\n"
-            "Lumi is online and ready.\n\n"
-            "You can talk to me normally or use /help "
-            "to explore my current systems."
+        await update.message.reply_text(
+            "✨ Hello. I'm Lumi AI.\n\n"
+            "I'm online and ready."
         )
+        return
 
-    # Identity
-    elif any(phrase in message for phrase in [
-        "who are you",
-        "what are you",
-        "tell me about yourself"
-    ]):
+    if "who are you" in text or "what are you" in text:
 
-        reply = (
-            "I'm Lumi AI ✨🧠\n\n"
-            "An evolving intelligent assistant designed for "
-            "conversation, automation and market intelligence.\n\n"
-            "My systems are continuously expanding."
+        await update.message.reply_text(
+            "🧠 I'm Lumi AI — your intelligent assistant.\n\n"
+            "I can communicate with you and analyze XAUUSD "
+            "using structured market information."
         )
+        return
 
-    # Health / status
-    elif any(phrase in message for phrase in [
-        "how are you",
-        "are you okay",
-        "are you online",
-        "are you working"
-    ]):
-
-        reply = (
-            "I'm doing great 😄🧠\n\n"
-            "My core systems are online and "
-            "I'm ready to work."
-        )
-
-    # Capabilities
-    elif any(phrase in message for phrase in [
-        "what can you do",
-        "your capabilities",
-        "help me"
-    ]):
-
-        reply = (
-            "I'm currently developing several capabilities 🧠\n\n"
-            "💬 Intelligent conversation\n"
-            "📊 Market intelligence\n"
-            "🟡 XAUUSD monitoring\n"
-            "📈 Structured analysis\n"
-            "🔔 Alert systems\n\n"
-            "Use /help to explore my command center."
-        )
-
-    # Gold
-    elif any(word in message for word in [
+    if any(word in text for word in [
         "gold",
         "xauusd",
         "xau",
-        "gold market"
-    ]):
-
-        reply = (
-            "🟡 XAUUSD detected.\n\n"
-            "My Gold Intelligence system is being expanded.\n\n"
-            "Soon I will combine market data with structured "
-            "analysis to provide observations such as trend, "
-            "bias, important zones and alert conditions.\n\n"
-            "⚠️ I will not present market predictions as guaranteed profits."
-        )
-
-    # Trading
-    elif any(word in message for word in [
-        "trade",
-        "trading",
         "forex",
-        "market"
+        "trading",
+        "market",
     ]):
 
-        reply = (
-            "📊 I detected a market-related question.\n\n"
-            "My market intelligence infrastructure is currently "
-            "being developed.\n\n"
-            "The next upgrade will connect me to real market "
-            "information so I can provide data-based observations."
+        await update.message.reply_text(
+            "🟡 I can analyze XAUUSD using live market data.\n\n"
+            "Use /gold or /analyze for the full structural report."
         )
+        return
 
-    # Thanks
-    elif any(word in message for word in [
-        "thank",
-        "thanks"
-    ]):
+    if "status" in text:
 
-        reply = (
-            "You're always welcome ❤️\n\n"
-            "I'm here with you. Lumi keeps evolving."
+        await status(update, context)
+        return
+
+    if "thank" in text:
+
+        await update.message.reply_text(
+            "❤️ You're welcome. Lumi is here."
         )
+        return
 
-    # Creator / development
-    elif any(phrase in message for phrase in [
-        "who created you",
-        "who made you"
-    ]):
-
-        reply = (
-            "I am Lumi AI 🧠✨\n\n"
-            "I am an evolving project being developed to grow "
-            "into an intelligent assistant for communication, "
-            "automation and market intelligence."
-        )
-
-    # Default
-    else:
-
-        reply = (
-            "🧠 I'm processing your message.\n\n"
-            "My conversational intelligence is still evolving, "
-            "but my systems are expanding continuously.\n\n"
-            "Try asking me about:\n"
-            "• Myself\n"
-            "• My capabilities\n"
-            "• Gold / XAUUSD\n"
-            "• Market intelligence\n\n"
-            "Or use /help."
-        )
-
-    await update.message.reply_text(reply)
+    await update.message.reply_text(
+        "🧠 I'm Lumi AI.\n\n"
+        "I understand you. You can ask me about my capabilities "
+        "or ask for an XAUUSD analysis with /gold."
+    )
 
 
-# -----------------------------
-# MAIN SYSTEM
-# -----------------------------
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
     if not TOKEN:
-        raise ValueError(
-            "TELEGRAM_BOT_TOKEN is not set"
+
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN environment variable is missing."
         )
 
-    logger.info("Initializing Lumi AI...")
+    application = Application.builder().token(TOKEN).build()
 
-    app = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("about", about))
+    application.add_handler(CommandHandler("gold", gold))
+    application.add_handler(CommandHandler("market", market))
+    application.add_handler(CommandHandler("analyze", analyze))
 
-    # Core commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("about", about))
-
-    # Market commands
-    app.add_handler(CommandHandler("gold", gold))
-    app.add_handler(CommandHandler("market", market))
-    app.add_handler(CommandHandler("analyze", analyze))
-    app.add_handler(CommandHandler("news", news))
-
-    # Natural conversation
-    app.add_handler(
+    application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            chat
+            chat,
         )
     )
 
-    logger.info("Lumi AI is online.")
-    logger.info("Starting Telegram polling...")
+    logger.info("Lumi AI is starting...")
 
-    app.run_polling()
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
