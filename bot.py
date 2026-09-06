@@ -1,6 +1,5 @@
 import os
 import logging
-from datetime import datetime
 
 import requests
 from telegram import Update
@@ -42,7 +41,7 @@ DATA_RANGE = "1mo"
 
 
 # =========================
-# START COMMAND
+# START
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -52,12 +51,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Available commands:\n"
         "/start - Start Lumi\n"
         "/help - Show commands\n\n"
-        "Market intelligence:\n"
+        "🟡 MARKET INTELLIGENCE\n"
         "• XAUUSD / Gold\n"
-        "• Market price monitoring\n"
-        "• Trend observation\n"
-        "• Momentum observation\n"
-        "• Structured market analysis\n\n"
+        "• Trend analysis\n"
+        "• Momentum analysis\n"
+        "• Support & resistance\n"
+        "• Market bias\n"
+        "• Confidence assessment\n\n"
         "⚠️ Lumi does not guarantee profits."
     )
 
@@ -65,7 +65,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# HELP COMMAND
+# HELP
 # =========================
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -73,7 +73,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 LUMI AI COMMANDS\n\n"
         "/start - Start Lumi\n"
         "/help - Show commands\n\n"
-        "Try sending:\n"
+        "Market analysis:\n"
         "• Gold\n"
         "• XAUUSD\n"
         "• Analyze XAUUSD\n"
@@ -84,10 +84,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# GOLD DATA
+# GET GOLD DATA
 # =========================
 
 def get_gold_data():
+
     params = {
         "interval": DATA_INTERVAL,
         "range": DATA_RANGE,
@@ -111,16 +112,21 @@ def get_gold_data():
     result = data.get("chart", {}).get("result")
 
     if not result:
-        raise ValueError("Yahoo Finance returned no market data.")
+        raise ValueError(
+            "Yahoo Finance returned no market data."
+        )
 
     result = result[0]
 
     meta = result.get("meta", {})
+
     indicators = result.get("indicators", {})
     quote = indicators.get("quote", [])
 
     if not quote:
-        raise ValueError("No price candles were returned.")
+        raise ValueError(
+            "No price candles were returned."
+        )
 
     candles = quote[0]
 
@@ -146,60 +152,253 @@ def get_gold_data():
         if value is not None
     ]
 
-    if len(clean_closes) < 2:
-        raise ValueError("Not enough price data for analysis.")
+    if len(clean_closes) < 20:
+        raise ValueError(
+            "Not enough candles for reliable analysis."
+        )
 
     return {
         "price": clean_closes[-1],
-        "previous_price": clean_closes[-2],
-        "high": max(clean_highs) if clean_highs else None,
-        "low": min(clean_lows) if clean_lows else None,
+        "closes": clean_closes,
+        "highs": clean_highs,
+        "lows": clean_lows,
         "currency": meta.get("currency", "USD"),
     }
 
 
 # =========================
-# GOLD ANALYSIS
+# MARKET ANALYSIS
 # =========================
 
 def analyze_gold():
+
     market = get_gold_data()
 
     price = market["price"]
-    previous_price = market["previous_price"]
+    closes = market["closes"]
+    highs = market["highs"]
+    lows = market["lows"]
+
+    # ---------------------------------
+    # SHORT-TERM CHANGE
+    # ---------------------------------
+
+    previous_price = closes[-2]
 
     change = price - previous_price
 
     if previous_price != 0:
-        change_percent = (change / previous_price) * 100
+        change_percent = (
+            change / previous_price
+        ) * 100
     else:
         change_percent = 0
 
-    if change > 0:
-        direction = "🟢 Short-term upward movement"
-    elif change < 0:
-        direction = "🔴 Short-term downward movement"
+
+    # ---------------------------------
+    # MOVING AVERAGES
+    # ---------------------------------
+
+    short_period = 10
+    long_period = 20
+
+    short_average = (
+        sum(closes[-short_period:])
+        / short_period
+    )
+
+    long_average = (
+        sum(closes[-long_period:])
+        / long_period
+    )
+
+
+    # ---------------------------------
+    # TREND
+    # ---------------------------------
+
+    if short_average > long_average and price > short_average:
+
+        trend = "🟢 Bullish"
+
+    elif short_average < long_average and price < short_average:
+
+        trend = "🔴 Bearish"
+
     else:
-        direction = "🟡 Short-term movement is flat"
+
+        trend = "🟡 Neutral / Mixed"
+
+
+    # ---------------------------------
+    # MOMENTUM
+    # ---------------------------------
+
+    momentum_lookback = 5
+
+    momentum_start = closes[-momentum_lookback - 1]
+
+    momentum_change = price - momentum_start
+
+    if momentum_start != 0:
+
+        momentum_percent = (
+            momentum_change
+            / momentum_start
+        ) * 100
+
+    else:
+
+        momentum_percent = 0
+
+
+    if momentum_percent > 0.20:
+
+        momentum = "🟢 Positive"
+
+    elif momentum_percent < -0.20:
+
+        momentum = "🔴 Negative"
+
+    else:
+
+        momentum = "🟡 Weak / Flat"
+
+
+    # ---------------------------------
+    # SUPPORT & RESISTANCE
+    # ---------------------------------
+
+    recent_highs = highs[-20:]
+    recent_lows = lows[-20:]
+
+    resistance = max(recent_highs)
+    support = min(recent_lows)
+
+
+    # ---------------------------------
+    # MARKET BIAS
+    # ---------------------------------
+
+    bullish_points = 0
+    bearish_points = 0
+
+    if price > short_average:
+        bullish_points += 1
+    else:
+        bearish_points += 1
+
+    if short_average > long_average:
+        bullish_points += 1
+    else:
+        bearish_points += 1
+
+    if momentum_percent > 0:
+        bullish_points += 1
+    elif momentum_percent < 0:
+        bearish_points += 1
+
+
+    if bullish_points > bearish_points:
+
+        bias = "🟢 BULLISH"
+
+    elif bearish_points > bullish_points:
+
+        bias = "🔴 BEARISH"
+
+    else:
+
+        bias = "🟡 NEUTRAL"
+
+
+    # ---------------------------------
+    # CONFIDENCE
+    # ---------------------------------
+
+    total_points = (
+        bullish_points
+        + bearish_points
+    )
+
+    if total_points > 0:
+
+        confidence = (
+            max(
+                bullish_points,
+                bearish_points
+            )
+            / total_points
+        ) * 100
+
+    else:
+
+        confidence = 50
+
+
+    # ---------------------------------
+    # STRUCTURE
+    # ---------------------------------
+
+    if price > resistance * 0.995:
+
+        structure = (
+            "Price is trading close to "
+            "the recent resistance area."
+        )
+
+    elif price < support * 1.005:
+
+        structure = (
+            "Price is trading close to "
+            "the recent support area."
+        )
+
+    else:
+
+        structure = (
+            "Price is trading within the "
+            "recent support/resistance range."
+        )
+
+
+    # ---------------------------------
+    # FINAL REPORT
+    # ---------------------------------
 
     message = (
         "🟡 XAUUSD / GOLD CENTER\n\n"
-        f"Current reference price: ${price:,.2f}\n"
-        f"Previous candle: ${previous_price:,.2f}\n"
-        f"Change: {change:+.2f} ({change_percent:+.2f}%)\n\n"
-        f"Market observation:\n"
-        f"{direction}\n\n"
-    )
 
-    if market["high"] is not None:
-        message += f"Period high: ${market['high']:,.2f}\n"
+        f"💰 Current price: ${price:,.2f}\n"
+        f"📊 Previous candle: ${previous_price:,.2f}\n"
+        f"📈 Change: {change:+.2f} "
+        f"({change_percent:+.2f}%)\n\n"
 
-    if market["low"] is not None:
-        message += f"Period low: ${market['low']:,.2f}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📊 MARKET STRUCTURE\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
 
-    message += (
-        "\n⚠️ This is market intelligence, not a guaranteed "
-        "trading signal or financial advice."
+        f"Trend: {trend}\n"
+        f"Momentum: {momentum}\n\n"
+
+        f"Support: ${support:,.2f}\n"
+        f"Resistance: ${resistance:,.2f}\n\n"
+
+        f"Structure:\n{structure}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🧠 LUMI MARKET BIAS\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
+        f"Bias: {bias}\n"
+        f"Confidence: {confidence:.0f}%\n\n"
+
+        "📌 Lumi observation:\n"
+        f"Short-term momentum change: "
+        f"{momentum_percent:+.2f}%\n\n"
+
+        "⚠️ This is algorithmic market intelligence, "
+        "not a guaranteed prediction or financial advice."
     )
 
     return message
@@ -213,6 +412,7 @@ async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
     if not update.message or not update.message.text:
         return
 
@@ -229,37 +429,52 @@ async def handle_message(
         "gold analysis",
     ]
 
-    if any(keyword in text for keyword in gold_keywords):
+    if any(
+        keyword in text
+        for keyword in gold_keywords
+    ):
+
         await update.message.reply_text(
-            "🟡 Lumi is analyzing XAUUSD...\n\n"
-            "Checking price, structure and recent movement..."
+            "🟡 Lumi intelligence:\n\n"
+            "Lumi is analyzing XAUUSD...\n\n"
+            "Checking price, trend, momentum, "
+            "structure and key levels..."
         )
 
         try:
-            analysis = analyze_gold()
-            await update.message.reply_text(analysis)
 
-        except Exception as error:
-            logger.exception("Gold data error: %s", error)
+            analysis = analyze_gold()
 
             await update.message.reply_text(
-                "⚠️ Lumi could not retrieve reliable XAUUSD data "
-                "right now.\n\n"
+                analysis
+            )
+
+        except Exception as error:
+
+            logger.exception(
+                "Gold analysis error: %s",
+                error,
+            )
+
+            await update.message.reply_text(
+                "⚠️ Lumi could not retrieve reliable "
+                "XAUUSD data right now.\n\n"
                 "No market signal will be invented.\n\n"
                 f"System detail: {error}"
             )
 
         return
 
+
     await update.message.reply_text(
         "🤖 Lumi is online.\n\n"
-        "I can currently help with XAUUSD / Gold market "
-        "intelligence.\n\n"
-        "Try sending:\n"
+        "I can currently analyze "
+        "XAUUSD / Gold.\n\n"
+        "Try:\n"
         "• Gold\n"
         "• XAUUSD\n"
         "• Analyze XAUUSD\n\n"
-        "Use /help to see commands."
+        "Use /help for commands."
     )
 
 
@@ -268,32 +483,52 @@ async def handle_message(
 # =========================
 
 def main():
+
     if not TOKEN:
+
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN environment variable is missing."
+            "TELEGRAM_BOT_TOKEN environment variable "
+            "is missing."
         )
 
-    application = Application.builder().token(TOKEN).build()
-
-    application.add_handler(
-        CommandHandler("start", start)
+    application = (
+        Application
+        .builder()
+        .token(TOKEN)
+        .build()
     )
 
     application.add_handler(
-        CommandHandler("help", help_command)
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command
+        )
     )
 
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            handle_message,
+            handle_message
         )
     )
 
-    logger.info("Lumi AI is starting...")
+    logger.info(
+        "Lumi AI is starting..."
+    )
 
     application.run_polling()
 
+
+# =========================
+# RUN
+# =========================
 
 if __name__ == "__main__":
     main()
