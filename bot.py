@@ -28,14 +28,20 @@ logging.basicConfig(
 logger = logging.getLogger("LumiAI")
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+logger = logging.getLogger("LumiAI")
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # Yahoo Finance chart endpoint.
-# XAUUSD=X is used as the spot-gold reference symbol.
+# GC=F is used as the gold futures reference symbol.
 MARKET_SYMBOL = "GC=F"
-MARKET_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+MARKET_URL = (
+    "https://query1.finance.yahoo.com/v8/finance/chart/"
     + MARKET_SYMBOL
-DATA_INTERVAL = "1h"
-DATA_RANGE = "1mo"
+)
+# Yahoo Finance chart endpoint.
+# XAUUSD=X is used as the spot-gold reference symbol.
+
 
 
 # ============================================================
