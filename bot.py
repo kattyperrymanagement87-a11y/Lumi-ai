@@ -32,8 +32,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # Yahoo Finance chart endpoint.
 # XAUUSD=X is used as the spot-gold reference symbol.
 MARKET_SYMBOL = "GC=F"
-MARKET_URL = (
-    "https://query1.finance.yahoo.com/v8/finance/chart/"
+MARKET_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
     + MARKET_SYMBOL
 DATA_INTERVAL = "1h"
 DATA_RANGE = "1mo"
