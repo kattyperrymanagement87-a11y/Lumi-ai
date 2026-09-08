@@ -21,6 +21,7 @@ from telegram.ext import (
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# GC=F = Gold futures market-data proxy
 MARKET_SYMBOL = "GC=F"
 
 MARKET_URL = (
@@ -31,10 +32,21 @@ MARKET_URL = (
 DATA_INTERVAL = "1h"
 DATA_RANGE = "1mo"
 
+# Background market check every 5 minutes
 MONITOR_INTERVAL = 300
+
+# Prevent repeated identical alerts
 ALERT_COOLDOWN_SECONDS = 1800
 
 DATABASE_FILE = "lumi.db"
+
+# Signal thresholds
+MIN_SIGNAL_CONFIDENCE = 80
+
+# ATR-based risk management
+STOP_ATR_MULTIPLIER = 1.20
+TP1_R_MULTIPLIER = 1.50
+TP2_R_MULTIPLIER = 2.50
 
 
 # ==================================================
@@ -60,7 +72,6 @@ def get_db_connection():
 def initialize_database():
 
     connection = get_db_connection()
-
     cursor = connection.cursor()
 
     cursor.execute(
@@ -251,11 +262,9 @@ def get_gold_data():
 
     data = response.json()
 
-    result = data.get(
-        "chart",
-        {}
-    ).get(
-        "result"
+    result = (
+        data.get("chart", {})
+        .get("result")
     )
 
     if not result:
@@ -297,23 +306,41 @@ def get_gold_data():
         []
     )
 
-    clean_closes = [
-        float(value)
-        for value in closes
-        if value is not None
-    ]
+    # Keep OHLC values aligned by candle.
+    clean_closes = []
+    clean_highs = []
+    clean_lows = []
 
-    clean_highs = [
-        float(value)
-        for value in highs
-        if value is not None
-    ]
+    candle_count = min(
+        len(closes),
+        len(highs),
+        len(lows),
+    )
 
-    clean_lows = [
-        float(value)
-        for value in lows
-        if value is not None
-    ]
+    for index in range(candle_count):
+
+        close = closes[index]
+        high = highs[index]
+        low = lows[index]
+
+        if (
+            close is None
+            or high is None
+            or low is None
+        ):
+            continue
+
+        clean_closes.append(
+            float(close)
+        )
+
+        clean_highs.append(
+            float(high)
+        )
+
+        clean_lows.append(
+            float(low)
+        )
 
     if len(clean_closes) < 60:
         raise ValueError(
@@ -364,8 +391,10 @@ def calculate_rsi(closes, period=14):
 
     changes = []
 
+    start = len(closes) - period
+
     for index in range(
-        len(closes) - period,
+        start,
         len(closes)
     ):
 
@@ -517,6 +546,11 @@ def analyze_market():
         14,
     )
 
+    if atr is None or atr <= 0:
+        raise ValueError(
+            "Unable to calculate reliable ATR."
+        )
+
     volatility_percent = (
         atr / price
     ) * 100
@@ -584,7 +618,7 @@ def analyze_market():
             "price below EMA 9"
         )
 
-    # EMA alignment
+    # EMA 9 / EMA 21
 
     if ema_9 > ema_21:
 
@@ -602,7 +636,7 @@ def analyze_market():
             "EMA 9 below EMA 21"
         )
 
-    # Medium trend
+    # EMA 21 / EMA 50
 
     if ema_21 > ema_50:
 
@@ -781,7 +815,7 @@ def analyze_market():
             "indicators are not strongly aligned"
         ]
 
-    return {
+    analysis = {
         "price": price,
         "previous_price": previous_price,
         "ema_9": ema_9,
@@ -803,6 +837,233 @@ def analyze_market():
         "reasons": reasons,
     }
 
+    # Add the trade setup
+    analysis["setup"] = build_trade_setup(
+        analysis
+    )
+
+    return analysis
+
+
+# ==================================================
+# TRADE SETUP ENGINE
+# ==================================================
+
+def build_trade_setup(analysis):
+
+    price = analysis["price"]
+    atr = analysis["atr"]
+
+    confidence = analysis["confidence"]
+
+    bullish_score = analysis["bullish_score"]
+    bearish_score = analysis["bearish_score"]
+
+    rsi = analysis["rsi"]
+
+    momentum_5 = analysis["momentum_5"]
+    momentum_20 = analysis["momentum_20"]
+
+    support = analysis["support"]
+    resistance = analysis["resistance"]
+
+    # ----------------------------------------------
+    # Default = NO TRADE
+    # ----------------------------------------------
+
+    setup = {
+        "type": "NO_TRADE",
+        "label": "🟡 NO TRADE",
+        "entry": None,
+        "stop_loss": None,
+        "tp1": None,
+        "tp2": None,
+        "risk": None,
+        "rr1": None,
+        "rr2": None,
+        "confidence": confidence,
+        "reasons": [],
+    }
+
+    # ----------------------------------------------
+    # BUY CONDITIONS
+    # ----------------------------------------------
+
+    bullish_setup = (
+        bullish_score >= 5
+        and bullish_score > bearish_score
+        and confidence >= MIN_SIGNAL_CONFIDENCE
+        and momentum_5 > 0.15
+        and momentum_20 > 0
+        and rsi >= 50
+        and rsi < 70
+    )
+
+    # ----------------------------------------------
+    # SELL CONDITIONS
+    # ----------------------------------------------
+
+    bearish_setup = (
+        bearish_score >= 5
+        and bearish_score > bullish_score
+        and confidence >= MIN_SIGNAL_CONFIDENCE
+        and momentum_5 < -0.15
+        and momentum_20 < 0
+        and rsi <= 50
+        and rsi > 30
+    )
+
+    # ----------------------------------------------
+    # BUY SETUP
+    # ----------------------------------------------
+
+    if bullish_setup:
+
+        entry = price
+
+        risk = atr * STOP_ATR_MULTIPLIER
+
+        stop_loss = entry - risk
+
+        tp1 = entry + (
+            risk * TP1_R_MULTIPLIER
+        )
+
+        tp2 = entry + (
+            risk * TP2_R_MULTIPLIER
+        )
+
+        # Avoid calling it a clean setup if
+        # immediate resistance is too close.
+        room_to_resistance = (
+            resistance - entry
+        )
+
+        reasons = [
+            "bullish EMA structure",
+            "bullish momentum alignment",
+            "RSI supports bullish momentum",
+            "medium-term movement is positive",
+        ]
+
+        if room_to_resistance < risk:
+
+            reasons.append(
+                "resistance is too close for a clean setup"
+            )
+
+            return {
+                **setup,
+                "reasons": reasons,
+            }
+
+        return {
+            "type": "BUY",
+            "label": "🟢 BUY SETUP",
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "tp1": tp1,
+            "tp2": tp2,
+            "risk": risk,
+            "rr1": TP1_R_MULTIPLIER,
+            "rr2": TP2_R_MULTIPLIER,
+            "confidence": confidence,
+            "reasons": reasons,
+        }
+
+    # ----------------------------------------------
+    # SELL SETUP
+    # ----------------------------------------------
+
+    if bearish_setup:
+
+        entry = price
+
+        risk = atr * STOP_ATR_MULTIPLIER
+
+        stop_loss = entry + risk
+
+        tp1 = entry - (
+            risk * TP1_R_MULTIPLIER
+        )
+
+        tp2 = entry - (
+            risk * TP2_R_MULTIPLIER
+        )
+
+        # Avoid calling it a clean setup if
+        # immediate support is too close.
+        room_to_support = (
+            entry - support
+        )
+
+        reasons = [
+            "bearish EMA structure",
+            "bearish momentum alignment",
+            "RSI supports bearish momentum",
+            "medium-term movement is negative",
+        ]
+
+        if room_to_support < risk:
+
+            reasons.append(
+                "support is too close for a clean setup"
+            )
+
+            return {
+                **setup,
+                "reasons": reasons,
+            }
+
+        return {
+            "type": "SELL",
+            "label": "🔴 SELL SETUP",
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "tp1": tp1,
+            "tp2": tp2,
+            "risk": risk,
+            "rr1": TP1_R_MULTIPLIER,
+            "rr2": TP2_R_MULTIPLIER,
+            "confidence": confidence,
+            "reasons": reasons,
+        }
+
+    # ----------------------------------------------
+    # NO TRADE REASONS
+    # ----------------------------------------------
+
+    no_trade_reasons = []
+
+    if confidence < MIN_SIGNAL_CONFIDENCE:
+        no_trade_reasons.append(
+            "indicator agreement is below signal threshold"
+        )
+
+    if abs(
+        bullish_score - bearish_score
+    ) < 2:
+        no_trade_reasons.append(
+            "bullish and bearish forces are too close"
+        )
+
+    if (
+        45 < rsi < 55
+        and abs(momentum_5) <= 0.15
+    ):
+        no_trade_reasons.append(
+            "momentum is too weak"
+        )
+
+    if not no_trade_reasons:
+        no_trade_reasons.append(
+            "conditions do not meet Lumi's trade criteria"
+        )
+
+    setup["reasons"] = no_trade_reasons
+
+    return setup
+
 
 # ==================================================
 # FORMAT MARKET REPORT
@@ -812,9 +1073,7 @@ def format_analysis(analysis):
 
     price = analysis["price"]
 
-    previous = (
-        analysis["previous_price"]
-    )
+    previous = analysis["previous_price"]
 
     change = (
         price - previous
@@ -828,7 +1087,11 @@ def format_analysis(analysis):
         analysis["reasons"][:4]
     )
 
-    return (
+    setup = analysis["setup"]
+
+    setup_type = setup["type"]
+
+    message = (
         "🟡 XAUUSD / GOLD INTELLIGENCE\n\n"
 
         f"💰 Price: ${price:,.2f}\n"
@@ -865,12 +1128,167 @@ def format_analysis(analysis):
         f"Resistance: "
         f"${analysis['resistance']:,.2f}\n\n"
 
-        "🧠 Lumi reasoning:\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎯 LUMI TRADE SETUP\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+    )
+
+    # ----------------------------------------------
+    # BUY / SELL SETUP
+    # ----------------------------------------------
+
+    if setup_type in (
+        "BUY",
+        "SELL",
+    ):
+
+        message += (
+            f"{setup['label']}\n\n"
+
+            f"🎯 Entry: "
+            f"${setup['entry']:,.2f}\n"
+
+            f"🛑 Stop Loss: "
+            f"${setup['stop_loss']:,.2f}\n"
+
+            f"💰 TP1: "
+            f"${setup['tp1']:,.2f}\n"
+
+            f"💰 TP2: "
+            f"${setup['tp2']:,.2f}\n\n"
+
+            f"📐 Risk distance: "
+            f"${setup['risk']:,.2f}\n"
+
+            f"📊 TP1 R:R: "
+            f"1:{setup['rr1']:.1f}\n"
+
+            f"📊 TP2 R:R: "
+            f"1:{setup['rr2']:.1f}\n\n"
+
+            f"🎯 Setup confidence: "
+            f"{setup['confidence']:.0f}%\n\n"
+
+            "🧠 Setup reasoning:\n"
+            + "\n".join(
+                f"• {reason}"
+                for reason in setup["reasons"]
+            )
+        )
+
+    else:
+
+        message += (
+            "🟡 NO TRADE\n\n"
+
+            "Lumi does not currently see a "
+            "sufficiently aligned setup.\n\n"
+
+            "Why:\n"
+            + "\n".join(
+                f"• {reason}"
+                for reason in setup["reasons"]
+            )
+        )
+
+    message += (
+        "\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🧠 LUMI REASONING\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+
         f"• {reasons}\n\n"
 
-        "⚠️ Indicator agreement is not a probability "
-        "of profit. This is automated market analysis, "
-        "not guaranteed financial advice."
+        "⚠️ IMPORTANT\n"
+        "This is automated market analysis, "
+        "not guaranteed financial advice. "
+        "The confidence score measures indicator "
+        "agreement, NOT probability of profit. "
+        "Always verify the live price and your "
+        "broker's XAUUSD price before acting."
+    )
+
+    return message
+
+
+# ==================================================
+# DIRECT SIGNAL REPORT
+# ==================================================
+
+def format_signal(analysis):
+
+    setup = analysis["setup"]
+
+    price = analysis["price"]
+
+    if setup["type"] == "NO_TRADE":
+
+        return (
+            "🟡 LUMI XAUUSD SIGNAL\n\n"
+
+            "🟡 NO TRADE\n\n"
+
+            f"Current price: ${price:,.2f}\n"
+            f"Bias: {analysis['bias']}\n"
+            f"Indicator agreement: "
+            f"{analysis['confidence']:.0f}%\n"
+            f"RSI: {analysis['rsi']:.1f}\n"
+            f"Momentum (5h): "
+            f"{analysis['momentum_5']:+.2f}%\n\n"
+
+            "Lumi is waiting for stronger "
+            "confirmation.\n\n"
+
+            "Reason:\n"
+            + "\n".join(
+                f"• {reason}"
+                for reason in setup["reasons"]
+            )
+            + "\n\n"
+
+            "No trade is preferable to forcing "
+            "a weak setup."
+        )
+
+    return (
+        "🚨 LUMI XAUUSD SIGNAL\n\n"
+
+        f"{setup['label']}\n\n"
+
+        f"💰 Current price: "
+        f"${price:,.2f}\n\n"
+
+        f"🎯 Entry: "
+        f"${setup['entry']:,.2f}\n"
+
+        f"🛑 Stop Loss: "
+        f"${setup['stop_loss']:,.2f}\n"
+
+        f"💰 TP1: "
+        f"${setup['tp1']:,.2f}\n"
+
+        f"💰 TP2: "
+        f"${setup['tp2']:,.2f}\n\n"
+
+        f"📊 Confidence: "
+        f"{setup['confidence']:.0f}%\n"
+
+        f"📐 TP1 R:R: "
+        f"1:{setup['rr1']:.1f}\n"
+
+        f"📐 TP2 R:R: "
+        f"1:{setup['rr2']:.1f}\n\n"
+
+        "🧠 Confirmation:\n"
+        + "\n".join(
+            f"• {reason}"
+            for reason in setup["reasons"]
+        )
+        + "\n\n"
+
+        "⚠️ Confidence means indicator agreement, "
+        "not probability of profit. Verify live "
+        "broker pricing before taking any trade."
     )
 
 
@@ -880,92 +1298,20 @@ def format_analysis(analysis):
 
 def detect_alert(analysis):
 
-    price = analysis["price"]
+    setup = analysis["setup"]
 
-    confidence = (
-        analysis["confidence"]
-    )
-
-    momentum = (
-        analysis["momentum_5"]
-    )
-
-    rsi = analysis["rsi"]
-
-    support = analysis["support"]
-
-    resistance = analysis["resistance"]
-
-    bias = analysis["bias"]
-
-    # Strong bullish alignment
-
-    if (
-        "BULLISH" in bias
-        and confidence >= 80
-        and momentum > 0.20
-    ):
+    if setup["type"] == "BUY":
 
         return (
-            "STRONG_BULLISH",
-            "🟢 Strong bullish indicator alignment."
+            "BUY_SETUP",
+            "🟢 BUY setup detected.",
         )
 
-    # Strong bearish alignment
-
-    if (
-        "BEARISH" in bias
-        and confidence >= 80
-        and momentum < -0.20
-    ):
+    if setup["type"] == "SELL":
 
         return (
-            "STRONG_BEARISH",
-            "🔴 Strong bearish indicator alignment."
-        )
-
-    # RSI extreme
-
-    if rsi <= 30:
-
-        return (
-            "OVERSOLD",
-            "🟢 RSI entered an oversold zone."
-        )
-
-    if rsi >= 70:
-
-        return (
-            "OVERBOUGHT",
-            "🔴 RSI entered an overbought zone."
-        )
-
-    # Distance to support
-
-    support_distance = (
-        abs(price - support)
-        / support
-    ) * 100
-
-    if support_distance <= 0.15:
-
-        return (
-            "NEAR_SUPPORT",
-            "📍 Price is very close to support."
-        )
-
-    # Distance to resistance
-
-    resistance_distance = (
-        abs(resistance - price)
-        / resistance
-    ) * 100
-
-    if resistance_distance <= 0.15:
-
-        return (
-            "NEAR_RESISTANCE",
-            "📍 Price is very close to resistance."
+            "SELL_SETUP",
+            "🔴 SELL setup detected.",
         )
 
     return None
@@ -1036,39 +1382,63 @@ async def send_alert(
     ):
         return
 
+    setup = analysis["setup"]
+
     message = (
-        "🚨 LUMI MARKET ALERT\n\n"
+        "🚨 LUMI TRADE ALERT\n\n"
 
         "🟡 XAUUSD / GOLD\n\n"
 
         f"{alert_message}\n\n"
 
-        f"💰 Price: "
-        f"${analysis['price']:,.2f}\n"
+        f"🎯 Setup: "
+        f"{setup['label']}\n"
 
-        f"📊 Trend: "
+        f"💰 Entry: "
+        f"${setup['entry']:,.2f}\n"
+
+        f"🛑 Stop Loss: "
+        f"${setup['stop_loss']:,.2f}\n"
+
+        f"💰 TP1: "
+        f"${setup['tp1']:,.2f}\n"
+
+        f"💰 TP2: "
+        f"${setup['tp2']:,.2f}\n\n"
+
+        f"📊 Confidence: "
+        f"{setup['confidence']:.0f}%\n"
+
+        f"📐 TP1 R:R: "
+        f"1:{setup['rr1']:.1f}\n"
+
+        f"📐 TP2 R:R: "
+        f"1:{setup['rr2']:.1f}\n\n"
+
+        f"📈 Trend: "
         f"{analysis['trend']}\n"
 
         f"🧠 Bias: "
         f"{analysis['bias']}\n"
 
-        f"🎯 Indicator agreement: "
-        f"{analysis['confidence']:.0f}%\n"
-
-        f"📈 Momentum: "
-        f"{analysis['momentum_5']:+.2f}%\n"
-
         f"RSI: "
-        f"{analysis['rsi']:.1f}\n\n"
+        f"{analysis['rsi']:.1f}\n"
 
-        f"📍 Support: "
-        f"${analysis['support']:,.2f}\n"
+        f"Momentum: "
+        f"{analysis['momentum_5']:+.2f}%\n\n"
 
-        f"📍 Resistance: "
-        f"${analysis['resistance']:,.2f}\n\n"
+        "Confirmation:\n"
+        + "\n".join(
+            f"• {reason}"
+            for reason in setup["reasons"]
+        )
+        + "\n\n"
 
-        "⚠️ Automated market observation. "
-        "Not a guaranteed trade signal."
+        "⚠️ Automated market alert. "
+        "Confidence is indicator agreement, "
+        "not probability of profit. "
+        "Verify the live broker price before "
+        "taking any action."
     )
 
     await application.bot.send_message(
@@ -1159,16 +1529,21 @@ async def start(
 
     await update.message.reply_text(
         "🤖 LUMI AI\n\n"
+
         "Lumi Intelligence is online.\n\n"
+
         "✅ This chat has been registered.\n"
-        "🚨 Automatic market alerts are ON.\n\n"
+        "🚨 Automatic trade alerts are ON.\n\n"
+
         "Commands:\n"
         "/gold - Full Gold analysis\n"
+        "/signal - Current trade setup\n"
         "/status - System status\n"
         "/alerts - Alert status\n"
         "/alerts on - Enable alerts\n"
         "/alerts off - Disable alerts\n"
         "/help - All commands\n\n"
+
         "⚠️ Lumi provides automated market "
         "intelligence, not guaranteed profits."
     )
@@ -1183,7 +1558,8 @@ async def help_command(
         "🤖 LUMI COMMAND CENTER\n\n"
 
         "MARKET:\n"
-        "/gold - Analyze XAUUSD\n"
+        "/gold - Full XAUUSD analysis\n"
+        "/signal - Current trade setup\n"
         "Gold - Analyze XAUUSD\n"
         "XAUUSD - Analyze XAUUSD\n\n"
 
@@ -1211,9 +1587,10 @@ async def gold_command(
     await update.message.reply_text(
         "🟡 Lumi Intelligence is analyzing "
         "XAUUSD...\n\n"
+
         "Checking EMA alignment, RSI, "
-        "momentum, volatility and "
-        "key price levels..."
+        "momentum, volatility, support, "
+        "resistance and trade conditions..."
     )
 
     try:
@@ -1238,7 +1615,52 @@ async def gold_command(
         await update.message.reply_text(
             "⚠️ Lumi could not retrieve "
             "reliable market data.\n\n"
+
             "No analysis will be invented.\n\n"
+
+            f"System detail: {error}"
+        )
+
+
+async def signal_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    register_chat(
+        update.effective_chat.id
+    )
+
+    await update.message.reply_text(
+        "🧠 Lumi is checking the current "
+        "XAUUSD trade conditions..."
+    )
+
+    try:
+
+        analysis = analyze_market()
+
+        signal = format_signal(
+            analysis
+        )
+
+        await update.message.reply_text(
+            signal
+        )
+
+    except Exception as error:
+
+        logger.exception(
+            "Signal analysis error: %s",
+            error,
+        )
+
+        await update.message.reply_text(
+            "⚠️ Lumi could not retrieve "
+            "reliable market data.\n\n"
+
+            "No signal will be invented.\n\n"
+
             f"System detail: {error}"
         )
 
@@ -1271,10 +1693,12 @@ async def alerts_command(
             )
 
             await update.message.reply_text(
-                "🚨 Lumi automatic alerts: ON\n\n"
-                "Lumi will monitor XAUUSD and "
-                "notify you when defined market "
-                "conditions are detected."
+                "🚨 Lumi automatic trade alerts: ON\n\n"
+
+                "Lumi will monitor XAUUSD every "
+                f"{MONITOR_INTERVAL // 60} minutes "
+                "and notify you when a defined "
+                "BUY or SELL setup appears."
             )
 
             return
@@ -1287,7 +1711,7 @@ async def alerts_command(
             )
 
             await update.message.reply_text(
-                "🔕 Lumi automatic alerts: OFF"
+                "🔕 Lumi automatic trade alerts: OFF"
             )
 
             return
@@ -1304,11 +1728,18 @@ async def alerts_command(
 
     await update.message.reply_text(
         "🚨 LUMI ALERT STATUS\n\n"
+
         f"Automatic alerts: {status_text}\n\n"
+
         f"Monitoring interval: "
         f"{MONITOR_INTERVAL // 60} minutes\n"
+
         "Duplicate alert cooldown: "
-        f"{ALERT_COOLDOWN_SECONDS // 60} minutes"
+        f"{ALERT_COOLDOWN_SECONDS // 60} minutes\n\n"
+
+        "Alert types:\n"
+        "🟢 BUY setup\n"
+        "🔴 SELL setup"
     )
 
 
@@ -1335,19 +1766,29 @@ async def status_command(
 
     await update.message.reply_text(
         "🟢 LUMI SYSTEM STATUS\n\n"
+
         "Telegram Connection: Active\n"
         "Market Intelligence: Active\n"
         "XAUUSD Monitor: Active\n"
         f"Alerts: {alert_status}\n"
+
         f"Check interval: "
         f"{MONITOR_INTERVAL // 60} minutes\n\n"
-        "Core modules:\n"
-        "• EMA trend engine\n"
-        "• RSI analysis\n"
+
+        "Gold engine:\n"
+        "• EMA 9 / 21 / 50\n"
+        "• RSI 14\n"
         "• Momentum analysis\n"
-        "• Volatility measurement\n"
+        "• ATR volatility\n"
         "• Support & resistance\n"
-        "• Alert detection"
+        "• BUY/SELL setup engine\n"
+        "• ATR-based Stop Loss\n"
+        "• TP1 / TP2 calculation\n"
+        "• Automatic alerts\n\n"
+
+        "Signal rule:\n"
+        f"Minimum agreement: "
+        f"{MIN_SIGNAL_CONFIDENCE:.0f}%"
     )
 
 
@@ -1381,6 +1822,9 @@ async def handle_message(
         "analyze xauusd",
         "analyse xauusd",
         "gold analysis",
+        "gold signal",
+        "gold setup",
+        "gold trade",
     ]
 
     if any(
@@ -1395,12 +1839,35 @@ async def handle_message(
 
         return
 
+    signal_keywords = [
+        "signal",
+        "trade setup",
+        "entry",
+        "buy or sell",
+        "buy sell",
+    ]
+
+    if any(
+        keyword in text
+        for keyword in signal_keywords
+    ):
+
+        await signal_command(
+            update,
+            context,
+        )
+
+        return
+
     await update.message.reply_text(
         "🤖 Lumi is online.\n\n"
+
         "Try:\n"
         "/gold\n"
+        "/signal\n"
         "Gold\n"
         "XAUUSD\n\n"
+
         "Use /help for commands."
     )
 
@@ -1472,6 +1939,13 @@ def main():
         CommandHandler(
             "gold",
             gold_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "signal",
+            signal_command,
         )
     )
 
