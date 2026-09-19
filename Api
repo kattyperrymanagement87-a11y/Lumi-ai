@@ -1,1 +1,6 @@
 telegram.py
+def handler(request):
+    return {
+        "status": "online",
+        "service": "Lumi AI 2.0"
+    }
