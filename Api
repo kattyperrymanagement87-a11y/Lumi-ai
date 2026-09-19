@@ -1,4 +1,4 @@
-telegram.py
+index.py
 def handler(request):
     return {
         "status": "online",
