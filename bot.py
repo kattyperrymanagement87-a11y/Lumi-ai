@@ -1733,20 +1733,38 @@ async def run_telegram():
 # MAIN
 # ============================================================
 
-if __name__ == "__main__":
+# ============================================================
+# RAILWAY STARTUP
+# ============================================================
 
-    import asyncio
+@app.on_event("startup")
+async def start_lumi_services():
 
     init_db()
 
-    if not BOT_TOKEN:
+    if BOT_TOKEN:
+        try:
+            application = create_telegram_app()
 
-        logger.error(
-            "TELEGRAM_BOT_TOKEN is missing."
-        )
+            if application:
+                await application.initialize()
+                await application.start()
 
+                if application.updater:
+                    await application.updater.start_polling(
+                        drop_pending_updates=True
+                    )
+
+                logger.info(
+                    "Lumi Telegram polling started successfully."
+                )
+
+        except Exception as exc:
+            logger.exception(
+                "Telegram startup failed: %s",
+                exc
+            )
     else:
-
-        asyncio.run(
-            run_telegram()
+        logger.warning(
+            "TELEGRAM_BOT_TOKEN is missing."
         )
