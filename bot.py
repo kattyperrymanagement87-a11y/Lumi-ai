@@ -14,7 +14,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# LUMI AI 2.0 — SELF-CONTAINED MARKET INTELLIGENCE ENGINE
+# LUMI AI 2.0 — MARKET INTELLIGENCE ENGINE
 # ============================================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -23,12 +23,20 @@ MONITOR_INTERVAL = 300
 ALERT_COOLDOWN_SECONDS = 1800
 DATABASE_FILE = "lumi.db"
 
-# Automatic alerts require genuine independent confirmation.
+# Automatic alerts require independent confirmation.
 MIN_SIGNAL_CONFIDENCE = 80
 
-# Yahoo Finance symbols.
+
+# ============================================================
+# MARKET SYMBOLS
+# ============================================================
+
+# IMPORTANT:
+# Yahoo Finance does not provide spot XAUUSD through XAUUSD=X.
+# GC=F is the Yahoo Finance Gold Futures reference.
 YAHOO_SYMBOLS = {
-    "XAUUSD": "XAUUSD=X",
+    "XAUUSD": "GC=F",
+
     "BTCUSD": "BTC-USD",
     "ETHUSD": "ETH-USD",
 
@@ -46,6 +54,7 @@ YAHOO_SYMBOLS = {
     "USDCAD": "CAD=X",
 }
 
+
 MARKETS = {
     "XAUUSD": "Gold",
     "BTCUSD": "Bitcoin",
@@ -62,6 +71,11 @@ MARKETS = {
     "AUDUSD": "AUD/USD",
     "USDCAD": "USD/CAD",
 }
+
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -235,7 +249,7 @@ def pct(value):
 
 
 # ============================================================
-# TECHNICAL INDICATORS
+# EMA
 # ============================================================
 
 def ema(values, period):
@@ -249,11 +263,15 @@ def ema(values, period):
 
     for price in values[period:]:
         current = (
-            price - current
-        ) * multiplier + current
+            (price - current) * multiplier
+        ) + current
 
     return current
 
+
+# ============================================================
+# RSI
+# ============================================================
 
 def rsi(values, period=14):
 
@@ -264,6 +282,7 @@ def rsi(values, period=14):
     losses = []
 
     for i in range(1, len(values)):
+
         change = values[i] - values[i - 1]
 
         if change >= 0:
@@ -286,6 +305,10 @@ def rsi(values, period=14):
 
     return 100 - (100 / (1 + rs))
 
+
+# ============================================================
+# ATR
+# ============================================================
 
 def atr(highs, lows, closes, period=14):
 
@@ -357,6 +380,7 @@ def fetch_market_data(symbol):
     payload = response.json()
 
     chart = payload.get("chart", {})
+
     results = chart.get("result")
 
     if not results:
@@ -366,8 +390,15 @@ def fetch_market_data(symbol):
 
     result = results[0]
 
-    timestamps = result.get("timestamp", [])
-    quote = result.get("indicators", {}).get(
+    timestamps = result.get(
+        "timestamp",
+        [],
+    )
+
+    quote = result.get(
+        "indicators",
+        {},
+    ).get(
         "quote",
         [{}],
     )[0]
@@ -401,7 +432,11 @@ def fetch_market_data(symbol):
                 }
             )
 
-        except (IndexError, TypeError, ValueError):
+        except (
+            IndexError,
+            TypeError,
+            ValueError,
+        ):
             continue
 
     if len(rows) < 30:
@@ -413,7 +448,7 @@ def fetch_market_data(symbol):
 
 
 # ============================================================
-# MARKET INTELLIGENCE ENGINE
+# MARKET INTELLIGENCE
 # ============================================================
 
 def analyze_market(symbol):
@@ -450,7 +485,11 @@ def analyze_market(symbol):
         14,
     )
 
-    if ema9 is None or ema21 is None or ema50 is None:
+    if (
+        ema9 is None
+        or ema21 is None
+        or ema50 is None
+    ):
         raise ValueError(
             "Not enough data for trend analysis."
         )
@@ -463,12 +502,14 @@ def analyze_market(symbol):
     momentum20h = None
 
     if len(closes) >= 6:
+
         momentum5h = (
             (price - closes[-6])
             / closes[-6]
         ) * 100
 
     if len(closes) >= 21:
+
         momentum20h = (
             (price - closes[-21])
             / closes[-21]
@@ -553,42 +594,55 @@ def analyze_market(symbol):
     reasoning = []
 
     if bullish_trend:
+
         buy_score += 30
+
         reasoning.append(
             "EMA structure is bullish."
         )
 
     elif bearish_trend:
+
         sell_score += 30
+
         reasoning.append(
             "EMA structure is bearish."
         )
 
     else:
+
         reasoning.append(
             "EMA structure is mixed."
         )
 
     if bullish_momentum:
+
         buy_score += 25
+
         reasoning.append(
             "5h and 20h momentum are positive."
         )
 
     elif bearish_momentum:
+
         sell_score += 25
+
         reasoning.append(
             "5h and 20h momentum are negative."
         )
 
     if rsi_bullish:
+
         buy_score += 15
+
         reasoning.append(
             "RSI supports bullish momentum."
         )
 
     elif rsi_bearish:
+
         sell_score += 15
+
         reasoning.append(
             "RSI supports bearish momentum."
         )
@@ -598,19 +652,23 @@ def analyze_market(symbol):
     # --------------------------------------------------------
 
     if price > resistance:
+
         buy_score += 20
+
         reasoning.append(
             "Price is above the recent resistance zone."
         )
 
     elif price < support:
+
         sell_score += 20
+
         reasoning.append(
             "Price is below the recent support zone."
         )
 
     # --------------------------------------------------------
-    # REGIME
+    # VOLATILITY REGIME
     # --------------------------------------------------------
 
     if atr14 is None or price == 0:
@@ -624,12 +682,15 @@ def analyze_market(symbol):
         ) * 100
 
         if volatility_percent < 0.20:
+
             regime = "LOW_VOLATILITY"
 
         elif volatility_percent < 0.60:
+
             regime = "NORMAL_VOLATILITY"
 
         else:
+
             regime = "HIGH_VOLATILITY"
 
     # --------------------------------------------------------
@@ -663,11 +724,6 @@ def analyze_market(symbol):
 
     else:
 
-        confidence = max(
-            buy_score,
-            sell_score,
-        )
-
         reasoning.append(
             "Evidence is not strong enough for a trade setup."
         )
@@ -677,12 +733,15 @@ def analyze_market(symbol):
     # --------------------------------------------------------
 
     if buy_score > sell_score:
+
         bias = "BULLISH"
 
     elif sell_score > buy_score:
+
         bias = "BEARISH"
 
     else:
+
         bias = "NEUTRAL"
 
     # --------------------------------------------------------
@@ -694,10 +753,13 @@ def analyze_market(symbol):
     take_profit1 = None
     take_profit2 = None
 
-    if setup in (
-        "BUY_SETUP",
-        "SELL_SETUP",
-    ) and atr14:
+    if (
+        setup in (
+            "BUY_SETUP",
+            "SELL_SETUP",
+        )
+        and atr14
+    ):
 
         entry = price
 
@@ -731,8 +793,7 @@ def analyze_market(symbol):
     # SAFETY STATUS
     # --------------------------------------------------------
 
-    # One market-data provider is NOT independent
-    # confirmation.
+    # One provider is not independent confirmation.
     market_status = "SINGLE_SOURCE"
 
     validation = "INDEPENDENT_UNAVAILABLE"
@@ -760,7 +821,8 @@ def analyze_market(symbol):
         "marketDataStatus": market_status,
 
         "globalSource": (
-            f"Yahoo Finance ({YAHOO_SYMBOLS[symbol]})"
+            f"Yahoo Finance "
+            f"({YAHOO_SYMBOLS[symbol]})"
         ),
 
         "priceValidation": validation,
@@ -811,7 +873,7 @@ def analyze_market(symbol):
 
         "reasoning": reasoning,
 
-        # XM is deliberately kept separate.
+        # XM remains separate until connected properly.
         "brokerPriceStatus": "UNAVAILABLE",
 
         "brokerSymbol": None,
@@ -886,12 +948,15 @@ def format_market_report(data):
     )
 
     if setup == "BUY_SETUP":
+
         decision = "BUY"
 
     elif setup == "SELL_SETUP":
+
         decision = "SELL"
 
     else:
+
         decision = "NO TRADE"
 
     lines = [
@@ -924,6 +989,7 @@ def format_market_report(data):
         "",
 
         f"Bias: {data.get('bias')}",
+
         f"Trend: {data.get('trend')}",
 
         f"RSI 14: "
@@ -973,6 +1039,7 @@ def format_market_report(data):
 
         lines.extend(
             [
+
                 f"Entry: "
                 f"{money(data.get('entryPrice'))}",
 
@@ -986,6 +1053,7 @@ def format_market_report(data):
                 f"{money(data.get('takeProfit2'))}",
 
                 "TP1 R:R: 1:1.5",
+
                 "TP2 R:R: 1:2.5",
             ]
         )
@@ -1011,13 +1079,16 @@ def format_market_report(data):
         )
 
         for item in reasoning[:8]:
+
             lines.append(
                 f"• {item}"
             )
 
     lines.extend(
         [
+
             "",
+
             "━━━━━━━━━━━━━━━━━━",
             "🛡 SAFETY",
             "━━━━━━━━━━━━━━━━━━",
@@ -1029,8 +1100,11 @@ def format_market_report(data):
             "Automatic trade alerts: BLOCKED",
 
             "",
+
             "⚠️ Market intelligence only.",
+
             "Not guaranteed financial advice.",
+
             "Verify executable broker pricing before acting.",
         ]
     )
@@ -1058,19 +1132,36 @@ def format_trade_alert(data):
 
     return "\n".join(
         [
+
             "🚨 LUMI TRADE ALERT",
+
             "",
+
             f"🟡 {data.get('symbol')}",
+
             f"{icon} {side} SETUP VALIDATED",
+
             "",
-            f"Entry: {money(data.get('entryPrice'))}",
-            f"Stop Loss: {money(data.get('stopLoss'))}",
-            f"TP1: {money(data.get('takeProfit1'))}",
-            f"TP2: {money(data.get('takeProfit2'))}",
+
+            f"Entry: "
+            f"{money(data.get('entryPrice'))}",
+
+            f"Stop Loss: "
+            f"{money(data.get('stopLoss'))}",
+
+            f"TP1: "
+            f"{money(data.get('takeProfit1'))}",
+
+            f"TP2: "
+            f"{money(data.get('takeProfit2'))}",
+
             "",
+
             f"Evidence score: "
             f"{data.get('confidence')}/100",
+
             "",
+
             "⚠️ Verify broker pricing and risk before acting.",
         ]
     )
@@ -1114,7 +1205,7 @@ async def send_alert(
 
 
 # ============================================================
-# AUTOMATIC MONITOR
+# AUTOMATIC MARKET MONITOR
 # ============================================================
 
 async def market_monitor(
@@ -1242,13 +1333,16 @@ async def market_command(
     if symbol not in MARKETS:
 
         await update.message.reply_text(
+
             "⚠️ Unsupported market.\n\n"
+
             "Use /help to see supported markets."
         )
 
         return
 
     await update.message.reply_text(
+
         f"🧠 Lumi is analysing {symbol} "
         "using direct market data..."
     )
@@ -1352,6 +1446,7 @@ async def alerts_command(
             "Lumi will monitor the supported markets.\n\n"
 
             "Automatic alerts still require:\n"
+
             "• Global live data\n"
             "• Independent confirmation\n"
             "• Evidence score ≥ 80\n"
@@ -1384,11 +1479,17 @@ async def alerts_command(
         "🚨 LUMI ALERT STATUS\n\n"
 
         f"Automatic alerts: {status}\n"
+
         f"Markets monitored: {len(MARKETS)}\n"
-        f"Check interval: {MONITOR_INTERVAL // 60} minutes\n"
-        f"Cooldown: {ALERT_COOLDOWN_SECONDS // 60} minutes\n\n"
+
+        f"Check interval: "
+        f"{MONITOR_INTERVAL // 60} minutes\n"
+
+        f"Cooldown: "
+        f"{ALERT_COOLDOWN_SECONDS // 60} minutes\n\n"
 
         "Alert gate:\n"
+
         "GLOBAL_LIVE\n"
         "+ INDEPENDENT_CONFIRMED\n"
         f"+ SCORE ≥ {MIN_SIGNAL_CONFIDENCE}"
@@ -1419,11 +1520,17 @@ async def status_command(
         "Signal Safety Gate: ACTIVE\n\n"
 
         f"Supported Markets: {len(MARKETS)}\n"
-        f"Monitoring: {MONITOR_INTERVAL // 60} minutes\n"
-        f"Minimum Evidence: {MIN_SIGNAL_CONFIDENCE}/100\n\n"
+
+        f"Monitoring: "
+        f"{MONITOR_INTERVAL // 60} minutes\n"
+
+        f"Minimum Evidence: "
+        f"{MIN_SIGNAL_CONFIDENCE}/100\n\n"
 
         "Automatic trade execution: OFF\n"
-        "Automatic alerts: BLOCKED until independent confirmation.\n\n"
+
+        "Automatic alerts: BLOCKED until "
+        "independent confirmation.\n\n"
 
         "No signal will be invented."
     )
@@ -1497,6 +1604,7 @@ async def handle_message(
         "🤖 Lumi AI 2.0 is online.\n\n"
 
         "Try:\n"
+
         "/gold\n"
         "/market XAUUSD\n"
         "/market NAS100\n"
