@@ -1,1682 +1,1731 @@
 import os
-import logging
+import math
+import time
 import sqlite3
+import logging
 from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
 
 import requests
+import pandas as pd
+import numpy as np
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 
 # ============================================================
-# LUMI AI 2.1 — MARKET INTELLIGENCE ENGINE
+# LUMI AI 2.2
+# XAUUSD / GOLD MARKET INTELLIGENCE ENGINE
 # ============================================================
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+VERSION = "2.2.0"
 
-MONITOR_INTERVAL = 300
-ALERT_COOLDOWN_SECONDS = 1800
-DATABASE_FILE = "lumi.db"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# Automatic alerts require independent confirmation.
-MIN_SIGNAL_CONFIDENCE = 80
+# Optional market API.
+# Keep your key in Railway/Vercel environment variables.
+MARKET_API_KEY = os.getenv("MARKET_API_KEY", "").strip()
 
-# ============================================================
-# DATA FRESHNESS RULES
-# ============================================================
+# Optional Twelve Data key if you use Twelve Data.
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
-# Lumi uses 1-hour candles.
-# Freshness is therefore treated conservatively.
+# Optional Alpha Vantage key.
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
 
-LIVE_MAX_AGE_SECONDS = 90 * 60          # 90 minutes
-AGING_MAX_AGE_SECONDS = 3 * 60 * 60     # 3 hours
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 
+SYMBOL = os.getenv("LUMI_SYMBOL", "XAUUSD").strip().upper()
 
-# ============================================================
-# MARKET SYMBOLS
-# ============================================================
+# Yahoo's gold futures symbol is GC=F.
+YAHOO_SYMBOL = os.getenv("YAHOO_SYMBOL", "GC=F").strip()
 
-YAHOO_SYMBOLS = {
-    "XAUUSD": "GC=F",
+TIMEFRAME = os.getenv("LUMI_TIMEFRAME", "1h").strip()
 
-    "BTCUSD": "BTC-USD",
-    "ETHUSD": "ETH-USD",
+MONITOR_INTERVAL = int(
+    os.getenv("MONITOR_INTERVAL", "300")
+)
 
-    "SPX500": "^GSPC",
-    "NAS100": "^NDX",
-    "DJ30": "^DJI",
-    "GER40": "^GDAXI",
-    "UK100": "^FTSE",
-    "JP225": "^N225",
+ALERT_COOLDOWN = int(
+    os.getenv("ALERT_COOLDOWN", "1800")
+)
 
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "JPY=X",
-    "AUDUSD": "AUDUSD=X",
-    "USDCAD": "CAD=X",
-}
+MIN_SIGNAL_CONFIDENCE = float(
+    os.getenv("MIN_SIGNAL_CONFIDENCE", "80")
+)
 
+ATR_STOP_MULTIPLIER = float(
+    os.getenv("ATR_STOP_MULTIPLIER", "1.20")
+)
 
-MARKETS = {
-    "XAUUSD": "Gold",
-    "BTCUSD": "Bitcoin",
-    "ETHUSD": "Ethereum",
-    "SPX500": "S&P 500",
-    "NAS100": "Nasdaq 100",
-    "DJ30": "Dow Jones",
-    "GER40": "DAX",
-    "UK100": "FTSE 100",
-    "JP225": "Nikkei 225",
-    "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
-    "USDJPY": "USD/JPY",
-    "AUDUSD": "AUD/USD",
-    "USDCAD": "USD/CAD",
-}
+TP1_R_MULTIPLIER = float(
+    os.getenv("TP1_R_MULTIPLIER", "1.50")
+)
 
+TP2_R_MULTIPLIER = float(
+    os.getenv("TP2_R_MULTIPLIER", "2.50")
+)
+
+MAX_DATA_AGE_MINUTES = float(
+    os.getenv("MAX_DATA_AGE_MINUTES", "90")
+)
+
+DATABASE = os.getenv(
+    "LUMI_DATABASE",
+    "lumi.db"
+)
+
+PORT = int(
+    os.getenv("PORT", "8000")
+)
 
 # ============================================================
 # LOGGING
 # ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logger = logging.getLogger("LumiAI")
+logger = logging.getLogger("lumi")
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
+
+app = FastAPI(
+    title="Lumi AI",
+    version=VERSION,
+    description="Lumi AI XAUUSD Market Intelligence API",
+)
+
+
+@app.get("/")
+async def root():
+    return {
+        "name": "Lumi AI",
+        "version": VERSION,
+        "status": "online",
+        "symbol": SYMBOL,
+        "engine": "Lumi 2.2",
+    }
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "service": "Lumi AI",
+        "version": VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/status")
+async def api_status():
+    return JSONResponse({
+        "status": "online",
+        "version": VERSION,
+        "market_symbol": SYMBOL,
+        "reference_source": "Yahoo Finance GC=F",
+        "market_api_configured": bool(MARKET_API_KEY),
+        "telegram_configured": bool(BOT_TOKEN),
+        "engine": "Lumi Intelligence 2.2",
+    })
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-def db():
-    return sqlite3.connect(DATABASE_FILE)
+def init_db():
+    conn = sqlite3.connect(DATABASE)
 
+    cursor = conn.cursor()
 
-def initialize_database():
-    with db() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                chat_id INTEGER PRIMARY KEY,
-                alerts_enabled INTEGER DEFAULT 1,
-                created_at TEXT,
-                last_alert_key TEXT,
-                last_alert_time TEXT
-            )
-            """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            active INTEGER DEFAULT 1,
+            created_at TEXT,
+            last_seen TEXT
         )
+    """)
 
-
-def register_chat(chat_id):
-    with db() as connection:
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO users
-            (chat_id, alerts_enabled, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (
-                chat_id,
-                1,
-                datetime.now(timezone.utc).isoformat(),
-            ),
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            direction TEXT,
+            entry REAL,
+            stop_loss REAL,
+            tp1 REAL,
+            tp2 REAL,
+            confidence REAL,
+            timestamp TEXT
         )
+    """)
+
+    conn.commit()
+    conn.close()
 
 
-def set_alert_status(chat_id, enabled):
-    with db() as connection:
-        connection.execute(
-            """
-            UPDATE users
-            SET alerts_enabled = ?
-            WHERE chat_id = ?
-            """,
-            (1 if enabled else 0, chat_id),
+def register_user(update: Update):
+    if not update.effective_chat:
+        return
+
+    chat_id = update.effective_chat.id
+
+    username = ""
+    first_name = ""
+
+    if update.effective_user:
+        username = update.effective_user.username or ""
+        first_name = update.effective_user.first_name or ""
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO users (
+            chat_id,
+            username,
+            first_name,
+            active,
+            created_at,
+            last_seen
         )
+        VALUES (?, ?, ?, 1, ?, ?)
+        ON CONFLICT(chat_id)
+        DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name,
+            active = 1,
+            last_seen = excluded.last_seen
+    """, (
+        chat_id,
+        username,
+        first_name,
+        now,
+        now,
+    ))
+
+    conn.commit()
+    conn.close()
 
 
-def get_alert_status(chat_id):
-    with db() as connection:
-        row = connection.execute(
-            """
-            SELECT alerts_enabled
-            FROM users
-            WHERE chat_id = ?
-            """,
-            (chat_id,),
-        ).fetchone()
+def get_active_users() -> List[int]:
+    conn = sqlite3.connect(DATABASE)
 
-    return bool(row[0]) if row else False
+    cursor = conn.cursor()
 
+    cursor.execute("""
+        SELECT chat_id
+        FROM users
+        WHERE active = 1
+    """)
 
-def get_alert_users():
-    with db() as connection:
-        rows = connection.execute(
-            """
-            SELECT chat_id
-            FROM users
-            WHERE alerts_enabled = 1
-            """
-        ).fetchall()
+    rows = cursor.fetchall()
 
-    return [row[0] for row in rows]
+    conn.close()
+
+    return [int(row[0]) for row in rows]
 
 
-# ============================================================
-# ALERT DUPLICATE PROTECTION
-# ============================================================
+def save_alert(
+    chat_id: int,
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    tp1: float,
+    tp2: float,
+    confidence: float,
+):
+    conn = sqlite3.connect(DATABASE)
 
-def alert_is_allowed(chat_id, alert_key):
+    cursor = conn.cursor()
 
-    with db() as connection:
-        row = connection.execute(
-            """
-            SELECT last_alert_key, last_alert_time
-            FROM users
-            WHERE chat_id = ?
-            """,
-            (chat_id,),
-        ).fetchone()
-
-    if not row or not row[1]:
-        return True
-
-    try:
-        previous_time = datetime.fromisoformat(row[1])
-
-        age = (
-            datetime.now(timezone.utc) - previous_time
-        ).total_seconds()
-
-        if row[0] == alert_key and age < ALERT_COOLDOWN_SECONDS:
-            return False
-
-        return True
-
-    except ValueError:
-        return True
-
-
-def save_alert(chat_id, alert_key):
-
-    with db() as connection:
-        connection.execute(
-            """
-            UPDATE users
-            SET last_alert_key = ?,
-                last_alert_time = ?
-            WHERE chat_id = ?
-            """,
-            (
-                alert_key,
-                datetime.now(timezone.utc).isoformat(),
-                chat_id,
-            ),
+    cursor.execute("""
+        INSERT INTO alerts (
+            chat_id,
+            direction,
+            entry,
+            stop_loss,
+            tp1,
+            tp2,
+            confidence,
+            timestamp
         )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        chat_id,
+        direction,
+        entry,
+        stop_loss,
+        tp1,
+        tp2,
+        confidence,
+        datetime.now(timezone.utc).isoformat(),
+    ))
+
+    conn.commit()
+    conn.close()
 
 
 # ============================================================
-# NUMERIC HELPERS
+# MARKET DATA
 # ============================================================
 
-def safe_float(value, default=None):
-
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def money(value):
-
-    value = safe_float(value)
-
-    if value is None:
-        return "—"
-
-    return f"${value:,.2f}"
-
-
-def pct(value):
-
-    value = safe_float(value)
-
-    if value is None:
-        return "—"
-
-    return f"{value:+.2f}%"
-
-
-def format_age(seconds):
-
-    seconds = int(max(0, seconds))
-
-    if seconds < 60:
-        return f"{seconds}s"
-
-    if seconds < 3600:
-        minutes = seconds // 60
-        return f"{minutes}m"
-
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-
-    if minutes:
-        return f"{hours}h {minutes}m"
-
-    return f"{hours}h"
-
-
-# ============================================================
-# DATA FRESHNESS
-# ============================================================
-
-def classify_freshness(age_seconds):
-
-    if age_seconds <= LIVE_MAX_AGE_SECONDS:
-        return "LIVE"
-
-    if age_seconds <= AGING_MAX_AGE_SECONDS:
-        return "AGING"
-
-    return "STALE"
-
-
-# ============================================================
-# EMA
-# ============================================================
-
-def ema(values, period):
-
-    if len(values) < period:
-        return None
-
-    multiplier = 2 / (period + 1)
-
-    current = sum(values[:period]) / period
-
-    for price in values[period:]:
-        current = (
-            (price - current) * multiplier
-        ) + current
-
-    return current
-
-
-# ============================================================
-# RSI
-# ============================================================
-
-def rsi(values, period=14):
-
-    if len(values) < period + 1:
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(values)):
-
-        change = values[i] - values[i - 1]
-
-        if change >= 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
-
-    recent_gains = gains[-period:]
-    recent_losses = losses[-period:]
-
-    avg_gain = sum(recent_gains) / period
-    avg_loss = sum(recent_losses) / period
-
-    if avg_loss == 0:
-        return 100
-
-    rs = avg_gain / avg_loss
-
-    return 100 - (100 / (1 + rs))
-
-
-# ============================================================
-# ATR
-# ============================================================
-
-def atr(highs, lows, closes, period=14):
-
-    if len(closes) < period + 1:
-        return None
-
-    true_ranges = []
-
-    for i in range(1, len(closes)):
-
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
-        )
-
-        true_ranges.append(tr)
-
-    if len(true_ranges) < period:
-        return None
-
-    return sum(true_ranges[-period:]) / period
-
-
-# ============================================================
-# YAHOO MARKET DATA
-# ============================================================
-
-def fetch_market_data(symbol):
-
-    if symbol not in YAHOO_SYMBOLS:
-        raise ValueError(
-            f"Unsupported market: {symbol}"
-        )
-
-    yahoo_symbol = YAHOO_SYMBOLS[symbol]
+def fetch_yahoo_data(
+    symbol: str = YAHOO_SYMBOL,
+    interval: str = TIMEFRAME,
+    range_period: str = "1mo",
+) -> Optional[pd.DataFrame]:
 
     url = (
-        "https://query1.finance.yahoo.com/v8/finance/chart/"
-        + yahoo_symbol
+        f"https://query1.finance.yahoo.com/v8/finance/chart/"
+        f"{symbol}"
     )
 
     params = {
-        "range": "5d",
-        "interval": "1h",
-        "includePrePost": "true",
-        "events": "div,splits",
+        "interval": interval,
+        "range": range_period,
     }
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/130 Safari/537.36"
-        )
-    }
+    try:
 
-    response = requests.get(
-        url,
-        params=params,
-        headers=headers,
-        timeout=20,
-    )
-
-    response.raise_for_status()
-
-    payload = response.json()
-
-    chart = payload.get("chart", {})
-
-    results = chart.get("result")
-
-    if not results:
-        raise ValueError(
-            "Yahoo returned no market data."
+        response = requests.get(
+            url,
+            params=params,
+            timeout=15,
+            headers={
+                "User-Agent": "Mozilla/5.0"
+            },
         )
 
-    result = results[0]
+        response.raise_for_status()
 
-    timestamps = result.get(
-        "timestamp",
-        [],
-    )
+        payload = response.json()
 
-    quote = result.get(
-        "indicators",
-        {},
-    ).get(
-        "quote",
-        [{}],
-    )[0]
+        result = payload.get("chart", {}).get("result")
 
-    opens = quote.get("open", [])
-    highs = quote.get("high", [])
-    lows = quote.get("low", [])
-    closes = quote.get("close", [])
+        if not result:
+            logger.warning("Yahoo returned no chart data.")
+            return None
 
-    rows = []
+        result = result[0]
 
-    for i in range(len(timestamps)):
+        timestamps = result.get("timestamp", [])
+        quote = result.get("indicators", {}).get("quote", [])
 
-        try:
+        if not timestamps or not quote:
+            return None
 
-            if (
-                opens[i] is None
-                or highs[i] is None
-                or lows[i] is None
-                or closes[i] is None
-            ):
-                continue
+        quote = quote[0]
 
-            rows.append(
-                {
-                    "timestamp": timestamps[i],
-                    "open": float(opens[i]),
-                    "high": float(highs[i]),
-                    "low": float(lows[i]),
-                    "close": float(closes[i]),
-                }
-            )
+        df = pd.DataFrame({
+            "timestamp": pd.to_datetime(
+                timestamps,
+                unit="s",
+                utc=True,
+            ),
+            "open": quote.get("open"),
+            "high": quote.get("high"),
+            "low": quote.get("low"),
+            "close": quote.get("close"),
+            "volume": quote.get("volume"),
+        })
 
-        except (
-            IndexError,
-            TypeError,
-            ValueError,
-        ):
-            continue
-
-    if len(rows) < 30:
-        raise ValueError(
-            "Insufficient market candles."
+        df = df.dropna(
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
         )
 
-    return rows
+        df = df.sort_values(
+            "timestamp"
+        )
+
+        df = df.reset_index(
+            drop=True
+        )
+
+        return df
+
+    except Exception as exc:
+        logger.exception(
+            "Yahoo data error: %s",
+            exc,
+        )
+
+        return None
 
 
 # ============================================================
-# MARKET INTELLIGENCE
+# OPTIONAL EXTERNAL XAUUSD DATA
 # ============================================================
 
-def analyze_market(symbol):
+def fetch_external_xauusd() -> Optional[Dict[str, Any]]:
+    """
+    Optional external feed.
 
-    candles = fetch_market_data(symbol)
+    Configure MARKET_API_KEY if your selected market
+    provider uses this endpoint.
 
-    closes = [
-        candle["close"]
-        for candle in candles
-    ]
+    This function intentionally fails safely rather
+    than pretending a price is live.
+    """
 
-    highs = [
-        candle["high"]
-        for candle in candles
-    ]
+    if not MARKET_API_KEY:
+        return None
 
-    lows = [
-        candle["low"]
-        for candle in candles
-    ]
+    # Generic endpoint can be overridden through environment.
+    url = os.getenv(
+        "MARKET_API_URL",
+        ""
+    ).strip()
 
-    price = closes[-1]
+    if not url:
+        return None
 
-    latest_timestamp = candles[-1]["timestamp"]
+    try:
 
-    now_timestamp = datetime.now(
-        timezone.utc
-    ).timestamp()
+        response = requests.get(
+            url,
+            params={
+                "symbol": SYMBOL,
+                "apikey": MARKET_API_KEY,
+            },
+            timeout=15,
+        )
 
-    freshness_seconds = max(
+        response.raise_for_status()
+
+        data = response.json()
+
+        price = (
+            data.get("price")
+            or data.get("close")
+            or data.get("last")
+            or data.get("rate")
+        )
+
+        if price is None:
+            return None
+
+        return {
+            "price": float(price),
+            "source": "External Market API",
+            "timestamp": datetime.now(timezone.utc),
+            "fresh": True,
+        }
+
+    except Exception as exc:
+
+        logger.warning(
+            "External market API failed: %s",
+            exc,
+        )
+
+        return None
+
+
+# ============================================================
+# DATA VALIDATION
+# ============================================================
+
+def calculate_data_age(
+    timestamp: pd.Timestamp,
+) -> float:
+
+    now = pd.Timestamp.now(
+        tz="UTC"
+    )
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize(
+            "UTC"
+        )
+
+    age = (
+        now - timestamp
+    ).total_seconds() / 60
+
+    return max(
         0,
-        int(
-            now_timestamp
-            - latest_timestamp
+        age,
+    )
+
+
+def validate_market_data(
+    df: pd.DataFrame,
+) -> Dict[str, Any]:
+
+    if df is None or df.empty:
+        return {
+            "valid": False,
+            "reason": "NO_DATA",
+        }
+
+    required = [
+        "open",
+        "high",
+        "low",
+        "close",
+    ]
+
+    for column in required:
+
+        if column not in df.columns:
+            return {
+                "valid": False,
+                "reason": f"MISSING_{column.upper()}",
+            }
+
+    latest_timestamp = df["timestamp"].iloc[-1]
+
+    age_minutes = calculate_data_age(
+        latest_timestamp
+    )
+
+    price = float(
+        df["close"].iloc[-1]
+    )
+
+    if not math.isfinite(price):
+        return {
+            "valid": False,
+            "reason": "INVALID_PRICE",
+        }
+
+    if price <= 0:
+        return {
+            "valid": False,
+            "reason": "INVALID_PRICE",
+        }
+
+    fresh = age_minutes <= MAX_DATA_AGE_MINUTES
+
+    return {
+        "valid": True,
+        "price": price,
+        "timestamp": latest_timestamp,
+        "age_minutes": age_minutes,
+        "fresh": fresh,
+        "status": (
+            "LIVE_REFERENCE"
+            if fresh
+            else "REFERENCE_ONLY"
         ),
+    }
+
+
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
+
+def calculate_rsi(
+    series: pd.Series,
+    period: int = 14,
+) -> pd.Series:
+
+    delta = series.diff()
+
+    gain = delta.clip(
+        lower=0
     )
 
-    freshness_status = classify_freshness(
-        freshness_seconds
+    loss = -delta.clip(
+        upper=0
     )
 
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
-    ema50 = ema(closes, 50)
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
 
-    rsi14 = rsi(closes, 14)
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
 
-    atr14 = atr(
-        highs,
-        lows,
-        closes,
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan,
+    )
+
+    rsi = 100 - (
+        100 / (1 + rs)
+    )
+
+    return rsi
+
+
+def calculate_atr(
+    df: pd.DataFrame,
+    period: int = 14,
+) -> pd.Series:
+
+    previous_close = df["close"].shift(1)
+
+    tr1 = (
+        df["high"] -
+        df["low"]
+    )
+
+    tr2 = (
+        df["high"] -
+        previous_close
+    ).abs()
+
+    tr3 = (
+        df["low"] -
+        previous_close
+    ).abs()
+
+    true_range = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1,
+    ).max(axis=1)
+
+    return true_range.rolling(
+        period
+    ).mean()
+
+
+def add_indicators(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    df = df.copy()
+
+    df["ema9"] = df["close"].ewm(
+        span=9,
+        adjust=False,
+    ).mean()
+
+    df["ema21"] = df["close"].ewm(
+        span=21,
+        adjust=False,
+    ).mean()
+
+    df["ema50"] = df["close"].ewm(
+        span=50,
+        adjust=False,
+    ).mean()
+
+    df["rsi"] = calculate_rsi(
+        df["close"],
         14,
     )
 
-    if (
-        ema9 is None
-        or ema21 is None
-        or ema50 is None
+    df["atr"] = calculate_atr(
+        df,
+        14,
+    )
+
+    df["momentum_5h"] = (
+        df["close"].pct_change(5)
+        * 100
+    )
+
+    df["momentum_20h"] = (
+        df["close"].pct_change(20)
+        * 100
+    )
+
+    df["support"] = (
+        df["low"]
+        .rolling(30)
+        .min()
+    )
+
+    df["resistance"] = (
+        df["high"]
+        .rolling(30)
+        .max()
+    )
+
+    return df
+
+
+# ============================================================
+# INTELLIGENCE ENGINE
+# ============================================================
+
+def clamp(
+    value: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+
+    return max(
+        minimum,
+        min(
+            maximum,
+            value,
+        ),
+    )
+
+
+def analyze_market(
+    df: pd.DataFrame,
+) -> Dict[str, Any]:
+
+    if df is None or len(df) < 60:
+
+        return {
+            "ready": False,
+            "reason": "INSUFFICIENT_DATA",
+        }
+
+    df = add_indicators(df)
+
+    row = df.iloc[-1]
+
+    price = float(
+        row["close"]
+    )
+
+    ema9 = float(
+        row["ema9"]
+    )
+
+    ema21 = float(
+        row["ema21"]
+    )
+
+    ema50 = float(
+        row["ema50"]
+    )
+
+    rsi = float(
+        row["rsi"]
+    )
+
+    atr = float(
+        row["atr"]
+    )
+
+    momentum5 = float(
+        row["momentum_5h"]
+    )
+
+    momentum20 = float(
+        row["momentum_20h"]
+    )
+
+    support = float(
+        row["support"]
+    )
+
+    resistance = float(
+        row["resistance"]
+    )
+
+    if not all(
+        math.isfinite(x)
+        for x in [
+            price,
+            ema9,
+            ema21,
+            ema50,
+            rsi,
+            atr,
+            momentum5,
+            momentum20,
+            support,
+            resistance,
+        ]
     ):
-        raise ValueError(
-            "Not enough data for trend analysis."
+
+        return {
+            "ready": False,
+            "reason": "INDICATOR_ERROR",
+        }
+
+    bullish_points = 0.0
+    bearish_points = 0.0
+
+    reasons_long = []
+    reasons_short = []
+
+    # --------------------------------------------------------
+    # EMA structure
+    # --------------------------------------------------------
+
+    if ema9 > ema21:
+        bullish_points += 15
+        reasons_long.append(
+            "EMA 9 above EMA 21"
+        )
+    else:
+        bearish_points += 15
+        reasons_short.append(
+            "EMA 9 below EMA 21"
         )
 
-    momentum5h = None
-    momentum20h = None
+    if ema21 > ema50:
+        bullish_points += 15
+        reasons_long.append(
+            "EMA 21 above EMA 50"
+        )
+    else:
+        bearish_points += 15
+        reasons_short.append(
+            "EMA 21 below EMA 50"
+        )
 
-    if len(closes) >= 6:
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
 
-        momentum5h = (
-            (price - closes[-6])
-            / closes[-6]
+    if 50 <= rsi <= 70:
+        bullish_points += 12
+        reasons_long.append(
+            "RSI supports bullish momentum"
+        )
+
+    elif 30 <= rsi < 50:
+        bearish_points += 12
+        reasons_short.append(
+            "RSI supports bearish momentum"
+        )
+
+    elif rsi > 70:
+        bearish_points += 8
+        reasons_short.append(
+            "RSI is elevated"
+        )
+
+    elif rsi < 30:
+        bullish_points += 8
+        reasons_long.append(
+            "RSI is deeply oversold"
+        )
+
+    # --------------------------------------------------------
+    # Momentum
+    # --------------------------------------------------------
+
+    if momentum5 > 0:
+        bullish_points += 10
+        reasons_long.append(
+            "5-candle momentum positive"
+        )
+    else:
+        bearish_points += 10
+        reasons_short.append(
+            "5-candle momentum negative"
+        )
+
+    if momentum20 > 0:
+        bullish_points += 10
+        reasons_long.append(
+            "20-candle momentum positive"
+        )
+    else:
+        bearish_points += 10
+        reasons_short.append(
+            "20-candle momentum negative"
+        )
+
+    # --------------------------------------------------------
+    # Price vs EMA50
+    # --------------------------------------------------------
+
+    if price > ema50:
+        bullish_points += 10
+        reasons_long.append(
+            "Price above EMA 50"
+        )
+    else:
+        bearish_points += 10
+        reasons_short.append(
+            "Price below EMA 50"
+        )
+
+    # --------------------------------------------------------
+    # Market structure
+    # --------------------------------------------------------
+
+    if price > support:
+        bullish_points += 4
+
+    if price < resistance:
+        bearish_points += 4
+
+    # --------------------------------------------------------
+    # Determine direction
+    # --------------------------------------------------------
+
+    total_direction_points = (
+        bullish_points +
+        bearish_points
+    )
+
+    if total_direction_points <= 0:
+        return {
+            "ready": False,
+            "reason": "NO_DIRECTION",
+        }
+
+    if bullish_points > bearish_points:
+
+        direction = "BUY"
+
+        confidence = (
+            bullish_points /
+            total_direction_points
         ) * 100
 
-    if len(closes) >= 21:
+        reasons = reasons_long
 
-        momentum20h = (
-            (price - closes[-21])
-            / closes[-21]
+    elif bearish_points > bullish_points:
+
+        direction = "SELL"
+
+        confidence = (
+            bearish_points /
+            total_direction_points
         ) * 100
 
-    # --------------------------------------------------------
-    # STRUCTURE
-    # --------------------------------------------------------
-
-    # Exclude the current candle from the reference range.
-    # This makes breakout detection more meaningful.
-    structure_window = candles[-31:-1]
-
-    if not structure_window:
-        raise ValueError(
-            "Insufficient structure data."
-        )
-
-    support = min(
-        candle["low"]
-        for candle in structure_window
-    )
-
-    resistance = max(
-        candle["high"]
-        for candle in structure_window
-    )
-
-    bullish_trend = (
-        ema9 > ema21 > ema50
-    )
-
-    bearish_trend = (
-        ema9 < ema21 < ema50
-    )
-
-    if bullish_trend:
-        trend = "BULLISH"
-
-    elif bearish_trend:
-        trend = "BEARISH"
+        reasons = reasons_short
 
     else:
-        trend = "MIXED"
 
-    bullish_momentum = (
-        momentum5h is not None
-        and momentum20h is not None
-        and momentum5h > 0
-        and momentum20h > 0
+        return {
+            "ready": True,
+            "signal": "NO_TRADE",
+            "confidence": 50,
+            "price": price,
+            "reason": "BALANCED_MARKET",
+        }
+
+    confidence = clamp(
+        confidence,
+        0,
+        100,
     )
 
-    bearish_momentum = (
-        momentum5h is not None
-        and momentum20h is not None
-        and momentum5h < 0
-        and momentum20h < 0
+    # --------------------------------------------------------
+    # Require meaningful trend agreement
+    # --------------------------------------------------------
+
+    signal = (
+        direction
+        if confidence >= MIN_SIGNAL_CONFIDENCE
+        else "NO_TRADE"
     )
 
-    rsi_bullish = (
-        rsi14 is not None
-        and 50 <= rsi14 < 70
-    )
+    # --------------------------------------------------------
+    # Entry / SL / TP
+    # --------------------------------------------------------
 
-    rsi_bearish = (
-        rsi14 is not None
-        and 30 < rsi14 <= 50
-    )
+    entry = price
 
-    buy_score = 0
-    sell_score = 0
+    risk = atr * ATR_STOP_MULTIPLIER
 
-    reasoning = []
+    if risk <= 0:
+        return {
+            "ready": False,
+            "reason": "INVALID_ATR",
+        }
 
-    if bullish_trend:
+    if direction == "BUY":
 
-        buy_score += 30
+        stop_loss = entry - risk
 
-        reasoning.append(
-            "EMA structure is bullish."
+        tp1 = entry + (
+            risk * TP1_R_MULTIPLIER
         )
 
-    elif bearish_trend:
-
-        sell_score += 30
-
-        reasoning.append(
-            "EMA structure is bearish."
+        tp2 = entry + (
+            risk * TP2_R_MULTIPLIER
         )
 
     else:
 
-        reasoning.append(
-            "EMA structure is mixed."
+        stop_loss = entry + risk
+
+        tp1 = entry - (
+            risk * TP1_R_MULTIPLIER
         )
 
-    if bullish_momentum:
-
-        buy_score += 25
-
-        reasoning.append(
-            "5h and 20h momentum are positive."
+        tp2 = entry - (
+            risk * TP2_R_MULTIPLIER
         )
-
-    elif bearish_momentum:
-
-        sell_score += 25
-
-        reasoning.append(
-            "5h and 20h momentum are negative."
-        )
-
-    if rsi_bullish:
-
-        buy_score += 15
-
-        reasoning.append(
-            "RSI supports bullish momentum."
-        )
-
-    elif rsi_bearish:
-
-        sell_score += 15
-
-        reasoning.append(
-            "RSI is below 50, showing "
-            "short-term bearish pressure."
-        )
-
-    # --------------------------------------------------------
-    # PRICE STRUCTURE
-    # --------------------------------------------------------
-
-    if price > resistance:
-
-        buy_score += 20
-
-        reasoning.append(
-            "Price is above the previous resistance zone."
-        )
-
-    elif price < support:
-
-        sell_score += 20
-
-        reasoning.append(
-            "Price is below the previous support zone."
-        )
-
-    else:
-
-        reasoning.append(
-            "Price remains inside the recent structure range."
-        )
-
-    # --------------------------------------------------------
-    # VOLATILITY
-    # --------------------------------------------------------
-
-    if atr14 is None or price == 0:
-
-        regime = "UNKNOWN"
-
-    else:
-
-        volatility_percent = (
-            atr14 / price
-        ) * 100
-
-        if volatility_percent < 0.20:
-            regime = "LOW_VOLATILITY"
-
-        elif volatility_percent < 0.60:
-            regime = "NORMAL_VOLATILITY"
-
-        else:
-            regime = "HIGH_VOLATILITY"
-
-    setup = "NO_TRADE"
-
-    confidence = max(
-        buy_score,
-        sell_score,
-    )
-
-    if (
-        buy_score >= 70
-        and buy_score > sell_score
-        and rsi14 is not None
-        and rsi14 < 70
-    ):
-
-        setup = "BUY_SETUP"
-
-    elif (
-        sell_score >= 70
-        and sell_score > buy_score
-        and rsi14 is not None
-        and rsi14 > 30
-    ):
-
-        setup = "SELL_SETUP"
-
-    else:
-
-        reasoning.append(
-            "Evidence is not strong enough for a trade setup."
-        )
-
-    # --------------------------------------------------------
-    # FRESHNESS SAFETY GATE
-    # --------------------------------------------------------
-
-    if freshness_status != "LIVE":
-
-        setup = "NO_TRADE"
-
-        if freshness_status == "AGING":
-
-            reasoning.append(
-                "Market data is aging; executable "
-                "signals are blocked."
-            )
-
-        else:
-
-            reasoning.append(
-                "Market data is stale; executable "
-                "signals are blocked."
-            )
-
-    # --------------------------------------------------------
-    # BIAS
-    # --------------------------------------------------------
-
-    if buy_score > sell_score:
-        bias = "BULLISH"
-
-    elif sell_score > buy_score:
-        bias = "BEARISH"
-
-    else:
-        bias = "NEUTRAL"
-
-    # --------------------------------------------------------
-    # TRADE LEVELS
-    # --------------------------------------------------------
-
-    entry = None
-    stop_loss = None
-    take_profit1 = None
-    take_profit2 = None
-
-    if (
-        setup in (
-            "BUY_SETUP",
-            "SELL_SETUP",
-        )
-        and atr14
-    ):
-
-        entry = price
-
-        risk = atr14 * 1.20
-
-        if setup == "BUY_SETUP":
-
-            stop_loss = entry - risk
-            take_profit1 = entry + risk * 1.50
-            take_profit2 = entry + risk * 2.50
-
-        else:
-
-            stop_loss = entry + risk
-            take_profit1 = entry - risk * 1.50
-            take_profit2 = entry - risk * 2.50
-
-    # --------------------------------------------------------
-    # SOURCE / VALIDATION
-    # --------------------------------------------------------
-
-    market_status = (
-        "GLOBAL_LIVE"
-        if freshness_status == "LIVE"
-        else "REFERENCE_ONLY"
-    )
-
-    validation = "INDEPENDENT_UNAVAILABLE"
 
     return {
-        "symbol": symbol,
-        "price": price,
-
-        "marketDataStatus": market_status,
-
-        "globalSource": (
-            f"Yahoo Finance "
-            f"({YAHOO_SYMBOLS[symbol]})"
+        "ready": True,
+        "signal": signal,
+        "direction": direction,
+        "confidence": round(
+            confidence,
+            1,
         ),
-
-        "priceValidation": validation,
-
-        "priceDeviationPercent": None,
-
-        "globalFreshnessSeconds": freshness_seconds,
-
-        "freshnessStatus": freshness_status,
-
-        "bias": bias,
-        "trend": trend,
-
-        "rsi": rsi14,
-
-        "momentum5h": momentum5h,
-        "momentum20h": momentum20h,
-
-        "regime": regime,
-
-        "timeframeConfirmation": confidence,
-
-        "support": support,
-        "resistance": resistance,
-
-        "structureBreak": (
-            "ABOVE_RESISTANCE"
-            if price > resistance
-            else
-            "BELOW_SUPPORT"
-            if price < support
-            else
-            "WITHIN_RANGE"
+        "price": round(
+            price,
+            2,
         ),
-
-        "setupType": setup,
-
-        "entryPrice": entry,
-        "stopLoss": stop_loss,
-        "takeProfit1": take_profit1,
-        "takeProfit2": take_profit2,
-
-        "confidence": confidence,
-
-        "reasoning": reasoning,
-
-        "brokerPriceStatus": "UNAVAILABLE",
-        "brokerSymbol": None,
-        "brokerBid": None,
-        "brokerAsk": None,
-        "brokerSpread": None,
+        "entry": round(
+            entry,
+            2,
+        ),
+        "stop_loss": round(
+            stop_loss,
+            2,
+        ),
+        "tp1": round(
+            tp1,
+            2,
+        ),
+        "tp2": round(
+            tp2,
+            2,
+        ),
+        "atr": round(
+            atr,
+            2,
+        ),
+        "rsi": round(
+            rsi,
+            1,
+        ),
+        "momentum5": round(
+            momentum5,
+            3,
+        ),
+        "momentum20": round(
+            momentum20,
+            3,
+        ),
+        "support": round(
+            support,
+            2,
+        ),
+        "resistance": round(
+            resistance,
+            2,
+        ),
+        "ema9": round(
+            ema9,
+            2,
+        ),
+        "ema21": round(
+            ema21,
+            2,
+        ),
+        "ema50": round(
+            ema50,
+            2,
+        ),
+        "reasons": reasons[:5],
     }
 
 
 # ============================================================
-# MARKET FETCH
+# FULL LUMI INTELLIGENCE
 # ============================================================
 
-def get_market(symbol):
+def get_lumi_analysis() -> Dict[str, Any]:
 
-    symbol = symbol.upper()
+    # Try external source first.
+    external = fetch_external_xauusd()
 
-    if symbol not in MARKETS:
-        raise ValueError(
-            f"Unsupported market: {symbol}"
+    # Yahoo remains the technical-analysis reference feed.
+    df = fetch_yahoo_data()
+
+    if df is None:
+
+        return {
+            "ok": False,
+            "error": "MARKET_DATA_UNAVAILABLE",
+            "message": (
+                "Lumi could not retrieve market data."
+            ),
+        }
+
+    validation = validate_market_data(
+        df
+    )
+
+    if not validation["valid"]:
+
+        return {
+            "ok": False,
+            "error": validation["reason"],
+        }
+
+    # Add technical intelligence.
+    analysis = analyze_market(
+        df
+    )
+
+    if not analysis.get("ready"):
+
+        return {
+            "ok": False,
+            "error": analysis.get(
+                "reason",
+                "ANALYSIS_FAILED",
+            ),
+        }
+
+    # --------------------------------------------------------
+    # Price source logic
+    # --------------------------------------------------------
+
+    if external:
+
+        market_price = external["price"]
+        price_source = external["source"]
+
+    else:
+
+        market_price = validation["price"]
+        price_source = "Yahoo Finance (GC=F)"
+
+    # IMPORTANT:
+    # If Yahoo is stale and no independent live source exists,
+    # Lumi must not pretend the price is live.
+    data_status = (
+        "LIVE"
+        if external
+        else validation["status"]
+    )
+
+    independent_validation = (
+        "AVAILABLE"
+        if external
+        else "UNAVAILABLE"
+    )
+
+    return {
+        "ok": True,
+        "version": VERSION,
+        "symbol": SYMBOL,
+        "price": round(
+            market_price,
+            2,
+        ),
+        "analysis_price": analysis["price"],
+        "data_status": data_status,
+        "source": price_source,
+        "validation": independent_validation,
+        "quote_age_minutes": round(
+            validation["age_minutes"],
+            1,
+        ),
+        "fresh": validation["fresh"],
+        "signal": analysis.get(
+            "signal",
+            "NO_TRADE",
+        ),
+        "direction": analysis.get(
+            "direction",
+            "NONE",
+        ),
+        "confidence": analysis.get(
+            "confidence",
+            0,
+        ),
+        "entry": analysis.get(
+            "entry"
+        ),
+        "stop_loss": analysis.get(
+            "stop_loss"
+        ),
+        "tp1": analysis.get(
+            "tp1"
+        ),
+        "tp2": analysis.get(
+            "tp2"
+        ),
+        "atr": analysis.get(
+            "atr"
+        ),
+        "rsi": analysis.get(
+            "rsi"
+        ),
+        "momentum5": analysis.get(
+            "momentum5"
+        ),
+        "momentum20": analysis.get(
+            "momentum20"
+        ),
+        "support": analysis.get(
+            "support"
+        ),
+        "resistance": analysis.get(
+            "resistance"
+        ),
+        "ema9": analysis.get(
+            "ema9"
+        ),
+        "ema21": analysis.get(
+            "ema21"
+        ),
+        "ema50": analysis.get(
+            "ema50"
+        ),
+        "reasons": analysis.get(
+            "reasons",
+            [],
+        ),
+    }
+
+
+# ============================================================
+# TELEGRAM FORMATTING
+# ============================================================
+
+def format_analysis(
+    data: Dict[str, Any],
+) -> str:
+
+    if not data.get("ok"):
+
+        return (
+            "🟡 <b>LUMI XAUUSD INTELLIGENCE</b>\n\n"
+            "⚠️ Market analysis unavailable.\n\n"
+            f"Reason: <code>{data.get('error')}</code>"
         )
 
-    return analyze_market(symbol)
-
-
-# ============================================================
-# ALERT SAFETY GATE
-# ============================================================
-
-def validated_alert(data):
-
-    setup = data.get("setupType")
-
-    market_status = data.get(
-        "marketDataStatus",
-        "REFERENCE_ONLY",
-    )
-
-    validation = data.get(
-        "priceValidation",
-        "INDEPENDENT_UNAVAILABLE",
-    )
-
-    freshness = data.get(
-        "freshnessStatus",
-        "STALE",
-    )
-
-    confidence = safe_float(
-        data.get("confidence"),
-        0,
-    )
-
-    return (
-        setup in (
-            "BUY_SETUP",
-            "SELL_SETUP",
-        )
-        and market_status == "GLOBAL_LIVE"
-        and freshness == "LIVE"
-        and validation == "INDEPENDENT_CONFIRMED"
-        and confidence >= MIN_SIGNAL_CONFIDENCE
-    )
-
-
-# ============================================================
-# MARKET REPORT
-# ============================================================
-
-def format_market_report(data):
-
-    setup = data.get(
-        "setupType",
+    signal = data.get(
+        "signal",
         "NO_TRADE",
     )
 
-    if setup == "BUY_SETUP":
-        decision = "BUY"
+    if signal == "BUY":
+        signal_text = "🟢 BUY SETUP"
 
-    elif setup == "SELL_SETUP":
-        decision = "SELL"
+    elif signal == "SELL":
+        signal_text = "🔴 SELL SETUP"
 
     else:
-        decision = "NO TRADE"
+        signal_text = "⚪ NO TRADE"
 
-    freshness = data.get(
-        "freshnessStatus",
-        "UNKNOWN",
+    freshness = (
+        "🟢 FRESH"
+        if data.get("fresh")
+        else "🔴 STALE"
     )
 
-    if freshness == "LIVE":
-        freshness_icon = "🟢"
-
-    elif freshness == "AGING":
-        freshness_icon = "🟡"
-
-    else:
-        freshness_icon = "🔴"
-
-    lines = [
-
-        f"🟡 LUMI {data.get('symbol', 'MARKET')} INTELLIGENCE",
-
-        "",
-
-        f"💰 Market price: "
-        f"{money(data.get('price'))}",
-
-        f"📡 Data status: "
-        f"{data.get('marketDataStatus')}",
-
-        f"🌐 Source: "
-        f"{data.get('globalSource')}",
-
-        f"🔎 Validation: "
-        f"{data.get('priceValidation')}",
-
-        f"⏱ Quote age: "
-        f"{format_age(data.get('globalFreshnessSeconds', 0))}",
-
-        f"{freshness_icon} Data freshness: "
-        f"{freshness}",
-
-        "",
-
-        "━━━━━━━━━━━━━━━━━━",
-        "📊 MARKET STRUCTURE",
-        "━━━━━━━━━━━━━━━━━━",
-
-        "",
-
-        f"Bias: {data.get('bias')}",
-
-        f"Trend: {data.get('trend')}",
-
-        f"RSI 14: "
-        f"{safe_float(data.get('rsi'), 0):.1f}",
-
-        f"Momentum 5h: "
-        f"{pct(data.get('momentum5h'))}",
-
-        f"Momentum 20h: "
-        f"{pct(data.get('momentum20h'))}",
-
-        f"Regime: "
-        f"{data.get('regime')}",
-
-        "",
-
-        "━━━━━━━━━━━━━━━━━━",
-        "📍 KEY LEVELS",
-        "━━━━━━━━━━━━━━━━━━",
-
-        "",
-
-        f"Support: "
-        f"{money(data.get('support'))}",
-
-        f"Resistance: "
-        f"{money(data.get('resistance'))}",
-
-        f"Structure: "
-        f"{data.get('structureBreak')}",
-
-        "",
-
-        "━━━━━━━━━━━━━━━━━━",
-        "🎯 LUMI SETUP",
-        "━━━━━━━━━━━━━━━━━━",
-
-        "",
-
-        f"Decision: {decision}",
-
-        f"Evidence score: "
-        f"{data.get('confidence', 0)}/100",
-    ]
-
-    if setup != "NO_TRADE":
-
-        lines.extend(
-            [
-                f"Entry: "
-                f"{money(data.get('entryPrice'))}",
-
-                f"Stop Loss: "
-                f"{money(data.get('stopLoss'))}",
-
-                f"TP1: "
-                f"{money(data.get('takeProfit1'))}",
-
-                f"TP2: "
-                f"{money(data.get('takeProfit2'))}",
-
-                "TP1 R:R: 1:1.5",
-                "TP2 R:R: 1:2.5",
-            ]
-        )
-
-    else:
-
-        lines.append(
-            "No executable setup is currently validated."
-        )
-
-    reasoning = data.get(
-        "reasoning",
+    reasons = data.get(
+        "reasons",
         [],
     )
 
-    if reasoning:
-
-        lines.extend(
-            [
-                "",
-                "🧠 LUMI REASONING",
-            ]
-        )
-
-        for item in reasoning[:8]:
-
-            lines.append(
-                f"• {item}"
-            )
-
-    lines.extend(
-        [
-
-            "",
-            "━━━━━━━━━━━━━━━━━━",
-            "🛡 SAFETY",
-            "━━━━━━━━━━━━━━━━━━",
-            "",
-
-            f"Data freshness: {freshness}",
-
-            "Independent confirmation: "
-            "NOT AVAILABLE",
-
-            "Automatic trade alerts: BLOCKED",
-
-            "",
-            "⚠️ Market intelligence only.",
-            "Not guaranteed financial advice.",
-            "Verify executable broker pricing before acting.",
-        ]
+    reason_text = "\n".join(
+        f"• {reason}"
+        for reason in reasons
     )
 
-    return "\n".join(lines)
+    return (
+        "🟡 <b>LUMI XAUUSD INTELLIGENCE 2.2</b>\n\n"
 
+        f"💰 <b>Market price:</b> "
+        f"${data['price']:,.2f}\n"
 
-# ============================================================
-# TRADE ALERT
-# ============================================================
+        f"📡 <b>Data status:</b> "
+        f"{data['data_status']}\n"
 
-def format_trade_alert(data):
+        f"🌐 <b>Source:</b> "
+        f"{data['source']}\n"
 
-    side = (
-        "BUY"
-        if data.get("setupType") == "BUY_SETUP"
-        else "SELL"
-    )
+        f"🔎 <b>Validation:</b> "
+        f"{data['validation']}\n"
 
-    icon = (
-        "🟢"
-        if side == "BUY"
-        else "🔴"
-    )
+        f"⏱ <b>Quote age:</b> "
+        f"{data['quote_age_minutes']} min\n"
 
-    return "\n".join(
-        [
-            "🚨 LUMI TRADE ALERT",
-            "",
-            f"🟡 {data.get('symbol')}",
-            f"{icon} {side} SETUP VALIDATED",
-            "",
-            f"Entry: {money(data.get('entryPrice'))}",
-            f"Stop Loss: {money(data.get('stopLoss'))}",
-            f"TP1: {money(data.get('takeProfit1'))}",
-            f"TP2: {money(data.get('takeProfit2'))}",
-            "",
-            f"Evidence score: {data.get('confidence')}/100",
-            "",
-            "⚠️ Verify broker pricing and risk before acting.",
-        ]
+        f"📊 <b>Data freshness:</b> "
+        f"{freshness}\n\n"
+
+        f"🎯 <b>Signal:</b> "
+        f"{signal_text}\n"
+
+        f"📈 <b>Confidence:</b> "
+        f"{data['confidence']:.1f}%\n\n"
+
+        f"💵 <b>Entry:</b> "
+        f"${data['entry']:,.2f}\n"
+
+        f"🛑 <b>Stop Loss:</b> "
+        f"${data['stop_loss']:,.2f}\n"
+
+        f"🎯 <b>TP1:</b> "
+        f"${data['tp1']:,.2f}\n"
+
+        f"🎯 <b>TP2:</b> "
+        f"${data['tp2']:,.2f}\n\n"
+
+        f"📐 <b>ATR:</b> "
+        f"{data['atr']:.2f}\n"
+
+        f"📊 <b>RSI:</b> "
+        f"{data['rsi']:.1f}\n"
+
+        f"📈 <b>EMA 9:</b> "
+        f"{data['ema9']:,.2f}\n"
+
+        f"📈 <b>EMA 21:</b> "
+        f"{data['ema21']:,.2f}\n"
+
+        f"📈 <b>EMA 50:</b> "
+        f"{data['ema50']:,.2f}\n\n"
+
+        f"🟢 <b>Support:</b> "
+        f"${data['support']:,.2f}\n"
+
+        f"🔴 <b>Resistance:</b> "
+        f"${data['resistance']:,.2f}\n\n"
+
+        f"<b>Lumi reasoning:</b>\n"
+        f"{reason_text or 'No strong confirmation.'}\n\n"
+
+        "⚠️ <i>Lumi provides market intelligence, "
+        "not guaranteed predictions or financial advice.</i>"
     )
 
 
 # ============================================================
-# SEND ALERT
+# TELEGRAM COMMANDS
 # ============================================================
 
-async def send_alert(
-    application,
-    chat_id,
-    data,
-):
-
-    if not validated_alert(data):
-        return
-
-    alert_key = (
-        f"{data.get('symbol')}:"
-        f"{data.get('setupType')}:"
-        f"{data.get('entryPrice')}:"
-        f"{data.get('confidence')}"
-    )
-
-    if not alert_is_allowed(
-        chat_id,
-        alert_key,
-    ):
-        return
-
-    await application.bot.send_message(
-        chat_id=chat_id,
-        text=format_trade_alert(data),
-    )
-
-    save_alert(
-        chat_id,
-        alert_key,
-    )
-
-
-# ============================================================
-# AUTOMATIC MARKET MONITOR
-# ============================================================
-
-async def market_monitor(
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    users = get_alert_users()
-
-    if not users:
-        return
-
-    for symbol in MARKETS:
-
-        try:
-
-            data = get_market(symbol)
-
-            if not validated_alert(data):
-                continue
-
-            for chat_id in users:
-
-                try:
-
-                    await send_alert(
-                        context.application,
-                        chat_id,
-                        data,
-                    )
-
-                except Exception:
-
-                    logger.exception(
-                        "Telegram alert failed."
-                    )
-
-        except Exception:
-
-            logger.exception(
-                "Market monitor failed for %s",
-                symbol,
-            )
-
-
-# ============================================================
-# /START
-# ============================================================
-
-async def start(
+async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    chat_id = update.effective_chat.id
-
-    register_chat(chat_id)
+    register_user(update)
 
     await update.message.reply_text(
-
-        "🤖 LUMI AI 2.1\n\n"
-
-        "Multi-market intelligence engine is online.\n\n"
-
-        "📡 Monitoring 14 markets.\n"
-        "🧠 Technical analysis active.\n"
-        "🛡 Freshness safety gate active.\n"
-        "🚨 Alerts require independent confirmation.\n\n"
-
-        "Use /help for commands."
+        (
+            "🟡 <b>Lumi AI 2.2</b>\n\n"
+            "Welcome to Lumi AI.\n\n"
+            "I monitor XAUUSD and analyze market "
+            "structure, momentum, EMA, RSI, ATR, "
+            "support and resistance.\n\n"
+            "Use /gold for the latest intelligence.\n"
+            "Use /status for system status.\n"
+            "Use /help for available commands.\n\n"
+            "⚠️ Lumi does not guarantee market outcomes."
+        ),
+        parse_mode="HTML",
     )
 
-
-# ============================================================
-# /HELP
-# ============================================================
 
 async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    await update.message.reply_text(
-
-        "🤖 LUMI AI 2.1\n\n"
-
-        "MARKETS\n"
-        "/gold — XAUUSD\n"
-        "/market SYMBOL\n\n"
-
-        "SIGNALS\n"
-        "/signal\n"
-        "/signal XAUUSD\n"
-        "/signal NAS100\n\n"
-
-        "ALERTS\n"
-        "/alerts\n"
-        "/alerts on\n"
-        "/alerts off\n\n"
-
-        "SYSTEM\n"
-        "/status\n"
-        "/help"
-    )
-
-
-# ============================================================
-# /MARKET
-# ============================================================
-
-async def market_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    register_chat(
-        update.effective_chat.id
-    )
-
-    symbol = (
-        context.args[0].upper()
-        if context.args
-        else "XAUUSD"
-    )
-
-    if symbol not in MARKETS:
-
-        await update.message.reply_text(
-            "⚠️ Unsupported market.\n\n"
-            "Use /help to see supported markets."
-        )
-
-        return
+    register_user(update)
 
     await update.message.reply_text(
-
-        f"🧠 Lumi is analysing {symbol} "
-        "using direct market data..."
+        (
+            "🟡 <b>LUMI AI 2.2 COMMANDS</b>\n\n"
+            "/start — Start Lumi\n"
+            "/gold — XAUUSD intelligence\n"
+            "/status — System status\n"
+            "/help — Show commands\n\n"
+            "Lumi analyzes market conditions using "
+            "technical indicators and only reports "
+            "a trade setup when its configured "
+            "confidence threshold is reached."
+        ),
+        parse_mode="HTML",
     )
 
-    try:
-
-        data = get_market(symbol)
-
-        await update.message.reply_text(
-            format_market_report(data)
-        )
-
-    except Exception as error:
-
-        logger.exception(
-            "Market analysis failed."
-        )
-
-        await update.message.reply_text(
-
-            "⚠️ Lumi could not retrieve "
-            "reliable market data.\n\n"
-
-            "No market signal will be invented.\n\n"
-
-            f"System detail: {error}"
-        )
-
-
-# ============================================================
-# /GOLD
-# ============================================================
-
-async def gold_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    context.args = ["XAUUSD"]
-
-    await market_command(
-        update,
-        context,
-    )
-
-
-# ============================================================
-# /SIGNAL
-# ============================================================
-
-async def signal_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    symbol = (
-        context.args[0].upper()
-        if context.args
-        and context.args[0].upper() in MARKETS
-        else "XAUUSD"
-    )
-
-    context.args = [symbol]
-
-    await market_command(
-        update,
-        context,
-    )
-
-
-# ============================================================
-# /ALERTS
-# ============================================================
-
-async def alerts_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    chat_id = update.effective_chat.id
-
-    register_chat(chat_id)
-
-    option = (
-        context.args[0].lower()
-        if context.args
-        else None
-    )
-
-    if option == "on":
-
-        set_alert_status(
-            chat_id,
-            True,
-        )
-
-        await update.message.reply_text(
-
-            "🚨 LUMI ALERTS: ON\n\n"
-
-            "Lumi will monitor the supported markets.\n\n"
-
-            "Automatic alerts still require:\n"
-
-            "• Fresh LIVE data\n"
-            "• Global live status\n"
-            "• Independent confirmation\n"
-            "• Evidence score ≥ 80\n"
-            "• No validation failure"
-        )
-
-        return
-
-    if option == "off":
-
-        set_alert_status(
-            chat_id,
-            False,
-        )
-
-        await update.message.reply_text(
-            "🔕 LUMI ALERTS: OFF"
-        )
-
-        return
-
-    status = (
-        "ON 🟢"
-        if get_alert_status(chat_id)
-        else "OFF 🔴"
-    )
-
-    await update.message.reply_text(
-
-        "🚨 LUMI ALERT STATUS\n\n"
-
-        f"Automatic alerts: {status}\n"
-
-        f"Markets monitored: {len(MARKETS)}\n"
-
-        f"Check interval: "
-        f"{MONITOR_INTERVAL // 60} minutes\n"
-
-        f"Cooldown: "
-        f"{ALERT_COOLDOWN_SECONDS // 60} minutes\n\n"
-
-        "Alert gate:\n"
-
-        "GLOBAL_LIVE\n"
-        "+ LIVE FRESHNESS\n"
-        "+ INDEPENDENT_CONFIRMED\n"
-        f"+ SCORE ≥ {MIN_SIGNAL_CONFIDENCE}"
-    )
-
-
-# ============================================================
-# /STATUS
-# ============================================================
 
 async def status_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    register_chat(
-        update.effective_chat.id
+    register_user(update)
+
+    external = bool(
+        MARKET_API_KEY
     )
 
     await update.message.reply_text(
-
-        "🟢 LUMI AI 2.1 STATUS\n\n"
-
-        "Telegram: ACTIVE\n"
-        "Market Engine: ACTIVE\n"
-        "Direct Market Source: ACTIVE\n"
-        "Freshness Gate: ACTIVE\n"
-        "Independent Validation: NOT CONNECTED\n"
-        "Signal Safety Gate: ACTIVE\n\n"
-
-        f"Supported Markets: {len(MARKETS)}\n"
-
-        f"Monitoring: "
-        f"{MONITOR_INTERVAL // 60} minutes\n"
-
-        "LIVE threshold: 90 minutes\n"
-        "STALE threshold: 3 hours\n\n"
-
-        f"Minimum Evidence: "
-        f"{MIN_SIGNAL_CONFIDENCE}/100\n\n"
-
-        "Automatic trade execution: OFF\n"
-
-        "Automatic alerts: BLOCKED until "
-        "independent confirmation.\n\n"
-
-        "No signal will be invented."
+        (
+            "🟡 <b>LUMI AI STATUS</b>\n\n"
+            "🟢 Lumi AI: Online\n"
+            "🟢 Telegram: Connected\n"
+            "🟢 Core Engine: Running\n"
+            f"🟢 Engine Version: {VERSION}\n"
+            f"📊 Symbol: {SYMBOL}\n"
+            f"🌐 Yahoo Reference: Active\n"
+            f"🔗 Independent API: "
+            f"{'Configured' if external else 'Not configured'}\n"
+            f"🎯 Minimum Confidence: "
+            f"{MIN_SIGNAL_CONFIDENCE:.0f}%\n"
+            f"⏱ Monitor Interval: "
+            f"{MONITOR_INTERVAL}s\n"
+        ),
+        parse_mode="HTML",
     )
 
 
-# ============================================================
-# NATURAL LANGUAGE
-# ============================================================
-
-async def handle_message(
+async def gold_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    if (
-        not update.message
-        or not update.message.text
-    ):
-        return
+    register_user(update)
 
-    text = (
-        update.message.text
-        .strip()
-        .lower()
+    message = await update.message.reply_text(
+        "🟡 Lumi is analyzing XAUUSD..."
     )
 
-    if (
-        "gold" in text
-        or "xauusd" in text
-        or "xau/usd" in text
+    data = get_lumi_analysis()
+
+    text = format_analysis(
+        data
+    )
+
+    await message.edit_text(
+        text,
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# ALERT ENGINE
+# ============================================================
+
+last_alert_signature = None
+last_alert_time = 0.0
+
+
+def create_alert_signature(
+    data: Dict[str, Any],
+) -> str:
+
+    return (
+        f"{data.get('direction')}:"
+        f"{data.get('entry')}:"
+        f"{data.get('stop_loss')}:"
+        f"{data.get('tp1')}:"
+        f"{data.get('tp2')}"
+    )
+
+
+def alert_is_allowed(
+    data: Dict[str, Any],
+) -> bool:
+
+    global last_alert_signature
+    global last_alert_time
+
+    if not data.get("ok"):
+        return False
+
+    if data.get("signal") not in (
+        "BUY",
+        "SELL",
     ):
+        return False
 
-        await gold_command(
-            update,
-            context,
-        )
+    if data.get("confidence", 0) < MIN_SIGNAL_CONFIDENCE:
+        return False
 
-        return
+    # Never alert from stale reference data.
+    if not data.get("fresh"):
+        return False
 
-    for symbol in MARKETS:
+    signature = create_alert_signature(
+        data
+    )
 
-        if symbol.lower() in text.replace(
-            "/",
-            "",
+    now = time.time()
+
+    if signature == last_alert_signature:
+
+        if (
+            now - last_alert_time
+            < ALERT_COOLDOWN
         ):
+            return False
 
-            context.args = [symbol]
+    last_alert_signature = signature
+    last_alert_time = now
 
-            await market_command(
-                update,
-                context,
-            )
+    return True
 
+
+def format_alert(
+    data: Dict[str, Any],
+) -> str:
+
+    if data["signal"] == "BUY":
+
+        icon = "🟢"
+        action = "BUY"
+
+    else:
+
+        icon = "🔴"
+        action = "SELL"
+
+    return (
+        "🚨 <b>LUMI XAUUSD ALERT</b>\n\n"
+
+        f"{icon} <b>{action} SETUP DETECTED</b>\n\n"
+
+        f"💰 <b>Entry:</b> "
+        f"${data['entry']:,.2f}\n"
+
+        f"🛑 <b>Stop Loss:</b> "
+        f"${data['stop_loss']:,.2f}\n"
+
+        f"🎯 <b>TP1:</b> "
+        f"${data['tp1']:,.2f}\n"
+
+        f"🎯 <b>TP2:</b> "
+        f"${data['tp2']:,.2f}\n\n"
+
+        f"📊 <b>Confidence:</b> "
+        f"{data['confidence']:.1f}%\n"
+
+        f"📐 <b>ATR:</b> "
+        f"{data['atr']:.2f}\n"
+
+        f"📊 <b>RSI:</b> "
+        f"{data['rsi']:.1f}\n\n"
+
+        f"🟢 <b>Support:</b> "
+        f"${data['support']:,.2f}\n"
+
+        f"🔴 <b>Resistance:</b> "
+        f"${data['resistance']:,.2f}\n\n"
+
+        "⚠️ <i>This is market intelligence, "
+        "not a guaranteed prediction or financial advice.</i>"
+    )
+
+
+async def monitor_market(
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    try:
+
+        data = get_lumi_analysis()
+
+        if not alert_is_allowed(
+            data
+        ):
             return
 
-    if (
-        "signal" in text
-        or "trade setup" in text
-        or "buy or sell" in text
-    ):
-
-        await signal_command(
-            update,
-            context,
+        alert = format_alert(
+            data
         )
 
-        return
+        users = get_active_users()
 
-    await update.message.reply_text(
+        for chat_id in users:
 
-        "🤖 Lumi AI 2.1 is online.\n\n"
+            try:
 
-        "Try:\n"
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=alert,
+                    parse_mode="HTML",
+                )
 
-        "/gold\n"
-        "/market XAUUSD\n"
-        "/market NAS100\n"
-        "/signal\n"
-        "/alerts\n"
-        "/status\n"
-        "/help"
+                save_alert(
+                    chat_id,
+                    data["direction"],
+                    data["entry"],
+                    data["stop_loss"],
+                    data["tp1"],
+                    data["tp2"],
+                    data["confidence"],
+                )
+
+            except Exception as exc:
+
+                logger.warning(
+                    "Could not send alert to %s: %s",
+                    chat_id,
+                    exc,
+                )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Monitor error: %s",
+            exc,
+        )
+
+
+# ============================================================
+# TELEGRAM APPLICATION
+# ============================================================
+
+telegram_app = None
+
+
+def create_telegram_app():
+
+    global telegram_app
+
+    if not BOT_TOKEN:
+
+        logger.warning(
+            "TELEGRAM_BOT_TOKEN is not configured."
+        )
+
+        return None
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
     )
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "status",
+            status_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "gold",
+            gold_command,
+        )
+    )
+
+    if application.job_queue:
+
+        application.job_queue.run_repeating(
+            monitor_market,
+            interval=MONITOR_INTERVAL,
+            first=30,
+            name="lumi_market_monitor",
+        )
+
+    else:
+
+        logger.warning(
+            "Job queue unavailable. "
+            "Install python-telegram-bot[job-queue]."
+        )
+
+    telegram_app = application
+
+    return application
 
 
 # ============================================================
 # STARTUP
 # ============================================================
 
-async def post_init(
-    application: Application,
-):
+@app.on_event("startup")
+async def startup_event():
 
-    initialize_database()
+    init_db()
 
-    if application.job_queue is None:
+    logger.info(
+        "========================================"
+    )
 
-        logger.error(
-            "JobQueue unavailable. "
-            "Check python-telegram-bot[job-queue]."
+    logger.info(
+        "LUMI AI %s STARTING",
+        VERSION,
+    )
+
+    logger.info(
+        "Symbol: %s",
+        SYMBOL,
+    )
+
+    logger.info(
+        "Yahoo symbol: %s",
+        YAHOO_SYMBOL,
+    )
+
+    logger.info(
+        "Telegram configured: %s",
+        bool(BOT_TOKEN),
+    )
+
+    logger.info(
+        "External market API configured: %s",
+        bool(MARKET_API_KEY),
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+
+# ============================================================
+# LOCAL / RAILWAY ENTRYPOINT
+# ============================================================
+
+async def run_telegram():
+
+    application = create_telegram_app()
+
+    if application is None:
+
+        logger.warning(
+            "Telegram application not started."
         )
 
         return
 
-    application.job_queue.run_repeating(
+    await application.initialize()
 
-        market_monitor,
+    await application.start()
 
-        interval=MONITOR_INTERVAL,
+    await application.updater.start_polling(
+        drop_pending_updates=True
+    )
 
-        first=10,
-
-        name="lumi_market_monitor",
+    logger.info(
+        "Lumi Telegram polling started."
     )
 
 
@@ -1684,64 +1733,20 @@ async def post_init(
 # MAIN
 # ============================================================
 
-def main():
-
-    if not TOKEN:
-
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN environment variable "
-            "is missing."
-        )
-
-    application = (
-        Application
-        .builder()
-        .token(TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    application.add_handler(
-        CommandHandler("help", help_command)
-    )
-
-    application.add_handler(
-        CommandHandler("gold", gold_command)
-    )
-
-    application.add_handler(
-        CommandHandler("market", market_command)
-    )
-
-    application.add_handler(
-        CommandHandler("signal", signal_command)
-    )
-
-    application.add_handler(
-        CommandHandler("alerts", alerts_command)
-    )
-
-    application.add_handler(
-        CommandHandler("status", status_command)
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_message,
-        )
-    )
-
-    logger.info(
-        "Lumi AI 2.1 starting."
-    )
-
-    application.run_polling()
-
-
 if __name__ == "__main__":
-    main()
+
+    import asyncio
+
+    init_db()
+
+    if not BOT_TOKEN:
+
+        logger.error(
+            "TELEGRAM_BOT_TOKEN is missing."
+        )
+
+    else:
+
+        asyncio.run(
+            run_telegram()
+        )
