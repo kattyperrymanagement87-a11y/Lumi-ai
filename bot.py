@@ -14,7 +14,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# LUMI AI 2.0 — MARKET INTELLIGENCE ENGINE
+# LUMI AI 2.1 — MARKET INTELLIGENCE ENGINE
 # ============================================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -26,14 +26,21 @@ DATABASE_FILE = "lumi.db"
 # Automatic alerts require independent confirmation.
 MIN_SIGNAL_CONFIDENCE = 80
 
+# ============================================================
+# DATA FRESHNESS RULES
+# ============================================================
+
+# Lumi uses 1-hour candles.
+# Freshness is therefore treated conservatively.
+
+LIVE_MAX_AGE_SECONDS = 90 * 60          # 90 minutes
+AGING_MAX_AGE_SECONDS = 3 * 60 * 60     # 3 hours
+
 
 # ============================================================
 # MARKET SYMBOLS
 # ============================================================
 
-# IMPORTANT:
-# Yahoo Finance does not provide spot XAUUSD through XAUUSD=X.
-# GC=F is the Yahoo Finance Gold Futures reference.
 YAHOO_SYMBOLS = {
     "XAUUSD": "GC=F",
 
@@ -246,6 +253,41 @@ def pct(value):
         return "—"
 
     return f"{value:+.2f}%"
+
+
+def format_age(seconds):
+
+    seconds = int(max(0, seconds))
+
+    if seconds < 60:
+        return f"{seconds}s"
+
+    if seconds < 3600:
+        minutes = seconds // 60
+        return f"{minutes}m"
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+
+    if minutes:
+        return f"{hours}h {minutes}m"
+
+    return f"{hours}h"
+
+
+# ============================================================
+# DATA FRESHNESS
+# ============================================================
+
+def classify_freshness(age_seconds):
+
+    if age_seconds <= LIVE_MAX_AGE_SECONDS:
+        return "LIVE"
+
+    if age_seconds <= AGING_MAX_AGE_SECONDS:
+        return "AGING"
+
+    return "STALE"
 
 
 # ============================================================
@@ -472,6 +514,24 @@ def analyze_market(symbol):
 
     price = closes[-1]
 
+    latest_timestamp = candles[-1]["timestamp"]
+
+    now_timestamp = datetime.now(
+        timezone.utc
+    ).timestamp()
+
+    freshness_seconds = max(
+        0,
+        int(
+            now_timestamp
+            - latest_timestamp
+        ),
+    )
+
+    freshness_status = classify_freshness(
+        freshness_seconds
+    )
+
     ema9 = ema(closes, 9)
     ema21 = ema(closes, 21)
     ema50 = ema(closes, 50)
@@ -494,10 +554,6 @@ def analyze_market(symbol):
             "Not enough data for trend analysis."
         )
 
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
-
     momentum5h = None
     momentum20h = None
 
@@ -516,10 +572,17 @@ def analyze_market(symbol):
         ) * 100
 
     # --------------------------------------------------------
-    # SUPPORT / RESISTANCE
+    # STRUCTURE
     # --------------------------------------------------------
 
-    structure_window = candles[-30:]
+    # Exclude the current candle from the reference range.
+    # This makes breakout detection more meaningful.
+    structure_window = candles[-31:-1]
+
+    if not structure_window:
+        raise ValueError(
+            "Insufficient structure data."
+        )
 
     support = min(
         candle["low"]
@@ -530,10 +593,6 @@ def analyze_market(symbol):
         candle["high"]
         for candle in structure_window
     )
-
-    # --------------------------------------------------------
-    # TREND
-    # --------------------------------------------------------
 
     bullish_trend = (
         ema9 > ema21 > ema50
@@ -552,10 +611,6 @@ def analyze_market(symbol):
     else:
         trend = "MIXED"
 
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
-
     bullish_momentum = (
         momentum5h is not None
         and momentum20h is not None
@@ -570,10 +625,6 @@ def analyze_market(symbol):
         and momentum20h < 0
     )
 
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
     rsi_bullish = (
         rsi14 is not None
         and 50 <= rsi14 < 70
@@ -583,10 +634,6 @@ def analyze_market(symbol):
         rsi14 is not None
         and 30 < rsi14 <= 50
     )
-
-    # --------------------------------------------------------
-    # EVIDENCE SCORE
-    # --------------------------------------------------------
 
     buy_score = 0
     sell_score = 0
@@ -644,7 +691,8 @@ def analyze_market(symbol):
         sell_score += 15
 
         reasoning.append(
-            "RSI supports bearish momentum."
+            "RSI is below 50, showing "
+            "short-term bearish pressure."
         )
 
     # --------------------------------------------------------
@@ -656,7 +704,7 @@ def analyze_market(symbol):
         buy_score += 20
 
         reasoning.append(
-            "Price is above the recent resistance zone."
+            "Price is above the previous resistance zone."
         )
 
     elif price < support:
@@ -664,11 +712,17 @@ def analyze_market(symbol):
         sell_score += 20
 
         reasoning.append(
-            "Price is below the recent support zone."
+            "Price is below the previous support zone."
+        )
+
+    else:
+
+        reasoning.append(
+            "Price remains inside the recent structure range."
         )
 
     # --------------------------------------------------------
-    # VOLATILITY REGIME
+    # VOLATILITY
     # --------------------------------------------------------
 
     if atr14 is None or price == 0:
@@ -682,20 +736,13 @@ def analyze_market(symbol):
         ) * 100
 
         if volatility_percent < 0.20:
-
             regime = "LOW_VOLATILITY"
 
         elif volatility_percent < 0.60:
-
             regime = "NORMAL_VOLATILITY"
 
         else:
-
             regime = "HIGH_VOLATILITY"
-
-    # --------------------------------------------------------
-    # DECISION
-    # --------------------------------------------------------
 
     setup = "NO_TRADE"
 
@@ -729,19 +776,38 @@ def analyze_market(symbol):
         )
 
     # --------------------------------------------------------
+    # FRESHNESS SAFETY GATE
+    # --------------------------------------------------------
+
+    if freshness_status != "LIVE":
+
+        setup = "NO_TRADE"
+
+        if freshness_status == "AGING":
+
+            reasoning.append(
+                "Market data is aging; executable "
+                "signals are blocked."
+            )
+
+        else:
+
+            reasoning.append(
+                "Market data is stale; executable "
+                "signals are blocked."
+            )
+
+    # --------------------------------------------------------
     # BIAS
     # --------------------------------------------------------
 
     if buy_score > sell_score:
-
         bias = "BULLISH"
 
     elif sell_score > buy_score:
-
         bias = "BEARISH"
 
     else:
-
         bias = "NEUTRAL"
 
     # --------------------------------------------------------
@@ -768,54 +834,29 @@ def analyze_market(symbol):
         if setup == "BUY_SETUP":
 
             stop_loss = entry - risk
-
-            take_profit1 = (
-                entry + risk * 1.50
-            )
-
-            take_profit2 = (
-                entry + risk * 2.50
-            )
+            take_profit1 = entry + risk * 1.50
+            take_profit2 = entry + risk * 2.50
 
         else:
 
             stop_loss = entry + risk
-
-            take_profit1 = (
-                entry - risk * 1.50
-            )
-
-            take_profit2 = (
-                entry - risk * 2.50
-            )
+            take_profit1 = entry - risk * 1.50
+            take_profit2 = entry - risk * 2.50
 
     # --------------------------------------------------------
-    # SAFETY STATUS
+    # SOURCE / VALIDATION
     # --------------------------------------------------------
 
-    # One provider is not independent confirmation.
-    market_status = "SINGLE_SOURCE"
+    market_status = (
+        "GLOBAL_LIVE"
+        if freshness_status == "LIVE"
+        else "REFERENCE_ONLY"
+    )
 
     validation = "INDEPENDENT_UNAVAILABLE"
 
-    latest_timestamp = candles[-1]["timestamp"]
-
-    now_timestamp = datetime.now(
-        timezone.utc
-    ).timestamp()
-
-    freshness = max(
-        0,
-        int(
-            now_timestamp
-            - latest_timestamp
-        ),
-    )
-
     return {
-
         "symbol": symbol,
-
         "price": price,
 
         "marketDataStatus": market_status,
@@ -829,16 +870,16 @@ def analyze_market(symbol):
 
         "priceDeviationPercent": None,
 
-        "globalFreshnessSeconds": freshness,
+        "globalFreshnessSeconds": freshness_seconds,
+
+        "freshnessStatus": freshness_status,
 
         "bias": bias,
-
         "trend": trend,
 
         "rsi": rsi14,
 
         "momentum5h": momentum5h,
-
         "momentum20h": momentum20h,
 
         "regime": regime,
@@ -846,7 +887,6 @@ def analyze_market(symbol):
         "timeframeConfirmation": confidence,
 
         "support": support,
-
         "resistance": resistance,
 
         "structureBreak": (
@@ -862,26 +902,18 @@ def analyze_market(symbol):
         "setupType": setup,
 
         "entryPrice": entry,
-
         "stopLoss": stop_loss,
-
         "takeProfit1": take_profit1,
-
         "takeProfit2": take_profit2,
 
         "confidence": confidence,
 
         "reasoning": reasoning,
 
-        # XM remains separate until connected properly.
         "brokerPriceStatus": "UNAVAILABLE",
-
         "brokerSymbol": None,
-
         "brokerBid": None,
-
         "brokerAsk": None,
-
         "brokerSpread": None,
     }
 
@@ -920,6 +952,11 @@ def validated_alert(data):
         "INDEPENDENT_UNAVAILABLE",
     )
 
+    freshness = data.get(
+        "freshnessStatus",
+        "STALE",
+    )
+
     confidence = safe_float(
         data.get("confidence"),
         0,
@@ -931,6 +968,7 @@ def validated_alert(data):
             "SELL_SETUP",
         )
         and market_status == "GLOBAL_LIVE"
+        and freshness == "LIVE"
         and validation == "INDEPENDENT_CONFIRMED"
         and confidence >= MIN_SIGNAL_CONFIDENCE
     )
@@ -948,16 +986,27 @@ def format_market_report(data):
     )
 
     if setup == "BUY_SETUP":
-
         decision = "BUY"
 
     elif setup == "SELL_SETUP":
-
         decision = "SELL"
 
     else:
-
         decision = "NO TRADE"
+
+    freshness = data.get(
+        "freshnessStatus",
+        "UNKNOWN",
+    )
+
+    if freshness == "LIVE":
+        freshness_icon = "🟢"
+
+    elif freshness == "AGING":
+        freshness_icon = "🟡"
+
+    else:
+        freshness_icon = "🔴"
 
     lines = [
 
@@ -978,7 +1027,10 @@ def format_market_report(data):
         f"{data.get('priceValidation')}",
 
         f"⏱ Quote age: "
-        f"{data.get('globalFreshnessSeconds', '—')}s",
+        f"{format_age(data.get('globalFreshnessSeconds', 0))}",
+
+        f"{freshness_icon} Data freshness: "
+        f"{freshness}",
 
         "",
 
@@ -1039,7 +1091,6 @@ def format_market_report(data):
 
         lines.extend(
             [
-
                 f"Entry: "
                 f"{money(data.get('entryPrice'))}",
 
@@ -1053,7 +1104,6 @@ def format_market_report(data):
                 f"{money(data.get('takeProfit2'))}",
 
                 "TP1 R:R: 1:1.5",
-
                 "TP2 R:R: 1:2.5",
             ]
         )
@@ -1088,23 +1138,21 @@ def format_market_report(data):
         [
 
             "",
-
             "━━━━━━━━━━━━━━━━━━",
             "🛡 SAFETY",
             "━━━━━━━━━━━━━━━━━━",
-
             "",
 
-            "Independent confirmation: NOT AVAILABLE",
+            f"Data freshness: {freshness}",
+
+            "Independent confirmation: "
+            "NOT AVAILABLE",
 
             "Automatic trade alerts: BLOCKED",
 
             "",
-
             "⚠️ Market intelligence only.",
-
             "Not guaranteed financial advice.",
-
             "Verify executable broker pricing before acting.",
         ]
     )
@@ -1132,36 +1180,18 @@ def format_trade_alert(data):
 
     return "\n".join(
         [
-
             "🚨 LUMI TRADE ALERT",
-
             "",
-
             f"🟡 {data.get('symbol')}",
-
             f"{icon} {side} SETUP VALIDATED",
-
             "",
-
-            f"Entry: "
-            f"{money(data.get('entryPrice'))}",
-
-            f"Stop Loss: "
-            f"{money(data.get('stopLoss'))}",
-
-            f"TP1: "
-            f"{money(data.get('takeProfit1'))}",
-
-            f"TP2: "
-            f"{money(data.get('takeProfit2'))}",
-
+            f"Entry: {money(data.get('entryPrice'))}",
+            f"Stop Loss: {money(data.get('stopLoss'))}",
+            f"TP1: {money(data.get('takeProfit1'))}",
+            f"TP2: {money(data.get('takeProfit2'))}",
             "",
-
-            f"Evidence score: "
-            f"{data.get('confidence')}/100",
-
+            f"Evidence score: {data.get('confidence')}/100",
             "",
-
             "⚠️ Verify broker pricing and risk before acting.",
         ]
     )
@@ -1265,13 +1295,13 @@ async def start(
 
     await update.message.reply_text(
 
-        "🤖 LUMI AI 2.0\n\n"
+        "🤖 LUMI AI 2.1\n\n"
 
-        "Market intelligence engine is online.\n\n"
+        "Multi-market intelligence engine is online.\n\n"
 
         "📡 Monitoring 14 markets.\n"
         "🧠 Technical analysis active.\n"
-        "🛡 Safety gate active.\n"
+        "🛡 Freshness safety gate active.\n"
         "🚨 Alerts require independent confirmation.\n\n"
 
         "Use /help for commands."
@@ -1289,7 +1319,7 @@ async def help_command(
 
     await update.message.reply_text(
 
-        "🤖 LUMI AI 2.0\n\n"
+        "🤖 LUMI AI 2.1\n\n"
 
         "MARKETS\n"
         "/gold — XAUUSD\n"
@@ -1333,9 +1363,7 @@ async def market_command(
     if symbol not in MARKETS:
 
         await update.message.reply_text(
-
             "⚠️ Unsupported market.\n\n"
-
             "Use /help to see supported markets."
         )
 
@@ -1447,7 +1475,8 @@ async def alerts_command(
 
             "Automatic alerts still require:\n"
 
-            "• Global live data\n"
+            "• Fresh LIVE data\n"
+            "• Global live status\n"
             "• Independent confirmation\n"
             "• Evidence score ≥ 80\n"
             "• No validation failure"
@@ -1491,6 +1520,7 @@ async def alerts_command(
         "Alert gate:\n"
 
         "GLOBAL_LIVE\n"
+        "+ LIVE FRESHNESS\n"
         "+ INDEPENDENT_CONFIRMED\n"
         f"+ SCORE ≥ {MIN_SIGNAL_CONFIDENCE}"
     )
@@ -1511,11 +1541,12 @@ async def status_command(
 
     await update.message.reply_text(
 
-        "🟢 LUMI AI 2.0 STATUS\n\n"
+        "🟢 LUMI AI 2.1 STATUS\n\n"
 
         "Telegram: ACTIVE\n"
         "Market Engine: ACTIVE\n"
         "Direct Market Source: ACTIVE\n"
+        "Freshness Gate: ACTIVE\n"
         "Independent Validation: NOT CONNECTED\n"
         "Signal Safety Gate: ACTIVE\n\n"
 
@@ -1523,6 +1554,9 @@ async def status_command(
 
         f"Monitoring: "
         f"{MONITOR_INTERVAL // 60} minutes\n"
+
+        "LIVE threshold: 90 minutes\n"
+        "STALE threshold: 3 hours\n\n"
 
         f"Minimum Evidence: "
         f"{MIN_SIGNAL_CONFIDENCE}/100\n\n"
@@ -1601,7 +1635,7 @@ async def handle_message(
 
     await update.message.reply_text(
 
-        "🤖 Lumi AI 2.0 is online.\n\n"
+        "🤖 Lumi AI 2.1 is online.\n\n"
 
         "Try:\n"
 
@@ -1668,52 +1702,31 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
+        CommandHandler("start", start)
     )
 
     application.add_handler(
-        CommandHandler(
-            "help",
-            help_command,
-        )
+        CommandHandler("help", help_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "gold",
-            gold_command,
-        )
+        CommandHandler("gold", gold_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "market",
-            market_command,
-        )
+        CommandHandler("market", market_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "signal",
-            signal_command,
-        )
+        CommandHandler("signal", signal_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "alerts",
-            alerts_command,
-        )
+        CommandHandler("alerts", alerts_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "status",
-            status_command,
-        )
+        CommandHandler("status", status_command)
     )
 
     application.add_handler(
@@ -1724,7 +1737,7 @@ def main():
     )
 
     logger.info(
-        "Lumi AI 2.0 starting."
+        "Lumi AI 2.1 starting."
     )
 
     application.run_polling()
