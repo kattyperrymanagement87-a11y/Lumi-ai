@@ -14,35 +14,48 @@ from telegram.ext import (
 )
 
 # ============================================================
-# LUMI AI — TELEGRAM MARKET INTELLIGENCE BOT
+# LUMI AI 2.0 — SELF-CONTAINED MARKET INTELLIGENCE ENGINE
 # ============================================================
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-LUMI_API_URL = os.getenv(
-    "LUMI_API_URL",
-    "https://54524a26-e9f6-42bd-8b63-89e6df7d3479.sandbox.floot.app",
-).rstrip("/")
 
 MONITOR_INTERVAL = 300
 ALERT_COOLDOWN_SECONDS = 1800
 DATABASE_FILE = "lumi.db"
 
-# Automatic Telegram alerts require this minimum evidence score.
+# Automatic alerts require genuine independent confirmation.
 MIN_SIGNAL_CONFIDENCE = 80
+
+# Yahoo Finance symbols.
+YAHOO_SYMBOLS = {
+    "XAUUSD": "XAUUSD=X",
+    "BTCUSD": "BTC-USD",
+    "ETHUSD": "ETH-USD",
+
+    "SPX500": "^GSPC",
+    "NAS100": "^NDX",
+    "DJ30": "^DJI",
+    "GER40": "^GDAXI",
+    "UK100": "^FTSE",
+    "JP225": "^N225",
+
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "JPY=X",
+    "AUDUSD": "AUDUSD=X",
+    "USDCAD": "CAD=X",
+}
 
 MARKETS = {
     "XAUUSD": "Gold",
     "BTCUSD": "Bitcoin",
     "ETHUSD": "Ethereum",
-
     "SPX500": "S&P 500",
     "NAS100": "Nasdaq 100",
     "DJ30": "Dow Jones",
     "GER40": "DAX",
     "UK100": "FTSE 100",
     "JP225": "Nikkei 225",
-
     "EURUSD": "EUR/USD",
     "GBPUSD": "GBP/USD",
     "USDJPY": "USD/JPY",
@@ -137,7 +150,7 @@ def get_alert_users():
 
 
 # ============================================================
-# DUPLICATE ALERT PROTECTION
+# ALERT DUPLICATE PROTECTION
 # ============================================================
 
 def alert_is_allowed(chat_id, alert_key):
@@ -190,7 +203,629 @@ def save_alert(chat_id, alert_key):
 
 
 # ============================================================
-# LUMI MARKET API
+# NUMERIC HELPERS
+# ============================================================
+
+def safe_float(value, default=None):
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def money(value):
+
+    value = safe_float(value)
+
+    if value is None:
+        return "—"
+
+    return f"${value:,.2f}"
+
+
+def pct(value):
+
+    value = safe_float(value)
+
+    if value is None:
+        return "—"
+
+    return f"{value:+.2f}%"
+
+
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
+
+def ema(values, period):
+
+    if len(values) < period:
+        return None
+
+    multiplier = 2 / (period + 1)
+
+    current = sum(values[:period]) / period
+
+    for price in values[period:]:
+        current = (
+            price - current
+        ) * multiplier + current
+
+    return current
+
+
+def rsi(values, period=14):
+
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+
+        if change >= 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
+
+    recent_gains = gains[-period:]
+    recent_losses = losses[-period:]
+
+    avg_gain = sum(recent_gains) / period
+    avg_loss = sum(recent_losses) / period
+
+    if avg_loss == 0:
+        return 100
+
+    rs = avg_gain / avg_loss
+
+    return 100 - (100 / (1 + rs))
+
+
+def atr(highs, lows, closes, period=14):
+
+    if len(closes) < period + 1:
+        return None
+
+    true_ranges = []
+
+    for i in range(1, len(closes)):
+
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+
+        true_ranges.append(tr)
+
+    if len(true_ranges) < period:
+        return None
+
+    return sum(true_ranges[-period:]) / period
+
+
+# ============================================================
+# YAHOO MARKET DATA
+# ============================================================
+
+def fetch_market_data(symbol):
+
+    if symbol not in YAHOO_SYMBOLS:
+        raise ValueError(
+            f"Unsupported market: {symbol}"
+        )
+
+    yahoo_symbol = YAHOO_SYMBOLS[symbol]
+
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        + yahoo_symbol
+    )
+
+    params = {
+        "range": "5d",
+        "interval": "1h",
+        "includePrePost": "true",
+        "events": "div,splits",
+    }
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/130 Safari/537.36"
+        )
+    }
+
+    response = requests.get(
+        url,
+        params=params,
+        headers=headers,
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    payload = response.json()
+
+    chart = payload.get("chart", {})
+    results = chart.get("result")
+
+    if not results:
+        raise ValueError(
+            "Yahoo returned no market data."
+        )
+
+    result = results[0]
+
+    timestamps = result.get("timestamp", [])
+    quote = result.get("indicators", {}).get(
+        "quote",
+        [{}],
+    )[0]
+
+    opens = quote.get("open", [])
+    highs = quote.get("high", [])
+    lows = quote.get("low", [])
+    closes = quote.get("close", [])
+
+    rows = []
+
+    for i in range(len(timestamps)):
+
+        try:
+
+            if (
+                opens[i] is None
+                or highs[i] is None
+                or lows[i] is None
+                or closes[i] is None
+            ):
+                continue
+
+            rows.append(
+                {
+                    "timestamp": timestamps[i],
+                    "open": float(opens[i]),
+                    "high": float(highs[i]),
+                    "low": float(lows[i]),
+                    "close": float(closes[i]),
+                }
+            )
+
+        except (IndexError, TypeError, ValueError):
+            continue
+
+    if len(rows) < 30:
+        raise ValueError(
+            "Insufficient market candles."
+        )
+
+    return rows
+
+
+# ============================================================
+# MARKET INTELLIGENCE ENGINE
+# ============================================================
+
+def analyze_market(symbol):
+
+    candles = fetch_market_data(symbol)
+
+    closes = [
+        candle["close"]
+        for candle in candles
+    ]
+
+    highs = [
+        candle["high"]
+        for candle in candles
+    ]
+
+    lows = [
+        candle["low"]
+        for candle in candles
+    ]
+
+    price = closes[-1]
+
+    ema9 = ema(closes, 9)
+    ema21 = ema(closes, 21)
+    ema50 = ema(closes, 50)
+
+    rsi14 = rsi(closes, 14)
+
+    atr14 = atr(
+        highs,
+        lows,
+        closes,
+        14,
+    )
+
+    if ema9 is None or ema21 is None or ema50 is None:
+        raise ValueError(
+            "Not enough data for trend analysis."
+        )
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    momentum5h = None
+    momentum20h = None
+
+    if len(closes) >= 6:
+        momentum5h = (
+            (price - closes[-6])
+            / closes[-6]
+        ) * 100
+
+    if len(closes) >= 21:
+        momentum20h = (
+            (price - closes[-21])
+            / closes[-21]
+        ) * 100
+
+    # --------------------------------------------------------
+    # SUPPORT / RESISTANCE
+    # --------------------------------------------------------
+
+    structure_window = candles[-30:]
+
+    support = min(
+        candle["low"]
+        for candle in structure_window
+    )
+
+    resistance = max(
+        candle["high"]
+        for candle in structure_window
+    )
+
+    # --------------------------------------------------------
+    # TREND
+    # --------------------------------------------------------
+
+    bullish_trend = (
+        ema9 > ema21 > ema50
+    )
+
+    bearish_trend = (
+        ema9 < ema21 < ema50
+    )
+
+    if bullish_trend:
+        trend = "BULLISH"
+
+    elif bearish_trend:
+        trend = "BEARISH"
+
+    else:
+        trend = "MIXED"
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    bullish_momentum = (
+        momentum5h is not None
+        and momentum20h is not None
+        and momentum5h > 0
+        and momentum20h > 0
+    )
+
+    bearish_momentum = (
+        momentum5h is not None
+        and momentum20h is not None
+        and momentum5h < 0
+        and momentum20h < 0
+    )
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    rsi_bullish = (
+        rsi14 is not None
+        and 50 <= rsi14 < 70
+    )
+
+    rsi_bearish = (
+        rsi14 is not None
+        and 30 < rsi14 <= 50
+    )
+
+    # --------------------------------------------------------
+    # EVIDENCE SCORE
+    # --------------------------------------------------------
+
+    buy_score = 0
+    sell_score = 0
+
+    reasoning = []
+
+    if bullish_trend:
+        buy_score += 30
+        reasoning.append(
+            "EMA structure is bullish."
+        )
+
+    elif bearish_trend:
+        sell_score += 30
+        reasoning.append(
+            "EMA structure is bearish."
+        )
+
+    else:
+        reasoning.append(
+            "EMA structure is mixed."
+        )
+
+    if bullish_momentum:
+        buy_score += 25
+        reasoning.append(
+            "5h and 20h momentum are positive."
+        )
+
+    elif bearish_momentum:
+        sell_score += 25
+        reasoning.append(
+            "5h and 20h momentum are negative."
+        )
+
+    if rsi_bullish:
+        buy_score += 15
+        reasoning.append(
+            "RSI supports bullish momentum."
+        )
+
+    elif rsi_bearish:
+        sell_score += 15
+        reasoning.append(
+            "RSI supports bearish momentum."
+        )
+
+    # --------------------------------------------------------
+    # PRICE STRUCTURE
+    # --------------------------------------------------------
+
+    if price > resistance:
+        buy_score += 20
+        reasoning.append(
+            "Price is above the recent resistance zone."
+        )
+
+    elif price < support:
+        sell_score += 20
+        reasoning.append(
+            "Price is below the recent support zone."
+        )
+
+    # --------------------------------------------------------
+    # REGIME
+    # --------------------------------------------------------
+
+    if atr14 is None or price == 0:
+
+        regime = "UNKNOWN"
+
+    else:
+
+        volatility_percent = (
+            atr14 / price
+        ) * 100
+
+        if volatility_percent < 0.20:
+            regime = "LOW_VOLATILITY"
+
+        elif volatility_percent < 0.60:
+            regime = "NORMAL_VOLATILITY"
+
+        else:
+            regime = "HIGH_VOLATILITY"
+
+    # --------------------------------------------------------
+    # DECISION
+    # --------------------------------------------------------
+
+    setup = "NO_TRADE"
+
+    confidence = max(
+        buy_score,
+        sell_score,
+    )
+
+    if (
+        buy_score >= 70
+        and buy_score > sell_score
+        and rsi14 is not None
+        and rsi14 < 70
+    ):
+
+        setup = "BUY_SETUP"
+
+    elif (
+        sell_score >= 70
+        and sell_score > buy_score
+        and rsi14 is not None
+        and rsi14 > 30
+    ):
+
+        setup = "SELL_SETUP"
+
+    else:
+
+        confidence = max(
+            buy_score,
+            sell_score,
+        )
+
+        reasoning.append(
+            "Evidence is not strong enough for a trade setup."
+        )
+
+    # --------------------------------------------------------
+    # BIAS
+    # --------------------------------------------------------
+
+    if buy_score > sell_score:
+        bias = "BULLISH"
+
+    elif sell_score > buy_score:
+        bias = "BEARISH"
+
+    else:
+        bias = "NEUTRAL"
+
+    # --------------------------------------------------------
+    # TRADE LEVELS
+    # --------------------------------------------------------
+
+    entry = None
+    stop_loss = None
+    take_profit1 = None
+    take_profit2 = None
+
+    if setup in (
+        "BUY_SETUP",
+        "SELL_SETUP",
+    ) and atr14:
+
+        entry = price
+
+        risk = atr14 * 1.20
+
+        if setup == "BUY_SETUP":
+
+            stop_loss = entry - risk
+
+            take_profit1 = (
+                entry + risk * 1.50
+            )
+
+            take_profit2 = (
+                entry + risk * 2.50
+            )
+
+        else:
+
+            stop_loss = entry + risk
+
+            take_profit1 = (
+                entry - risk * 1.50
+            )
+
+            take_profit2 = (
+                entry - risk * 2.50
+            )
+
+    # --------------------------------------------------------
+    # SAFETY STATUS
+    # --------------------------------------------------------
+
+    # One market-data provider is NOT independent
+    # confirmation.
+    market_status = "SINGLE_SOURCE"
+
+    validation = "INDEPENDENT_UNAVAILABLE"
+
+    latest_timestamp = candles[-1]["timestamp"]
+
+    now_timestamp = datetime.now(
+        timezone.utc
+    ).timestamp()
+
+    freshness = max(
+        0,
+        int(
+            now_timestamp
+            - latest_timestamp
+        ),
+    )
+
+    return {
+
+        "symbol": symbol,
+
+        "price": price,
+
+        "marketDataStatus": market_status,
+
+        "globalSource": (
+            f"Yahoo Finance ({YAHOO_SYMBOLS[symbol]})"
+        ),
+
+        "priceValidation": validation,
+
+        "priceDeviationPercent": None,
+
+        "globalFreshnessSeconds": freshness,
+
+        "bias": bias,
+
+        "trend": trend,
+
+        "rsi": rsi14,
+
+        "momentum5h": momentum5h,
+
+        "momentum20h": momentum20h,
+
+        "regime": regime,
+
+        "timeframeConfirmation": confidence,
+
+        "support": support,
+
+        "resistance": resistance,
+
+        "structureBreak": (
+            "ABOVE_RESISTANCE"
+            if price > resistance
+            else
+            "BELOW_SUPPORT"
+            if price < support
+            else
+            "WITHIN_RANGE"
+        ),
+
+        "setupType": setup,
+
+        "entryPrice": entry,
+
+        "stopLoss": stop_loss,
+
+        "takeProfit1": take_profit1,
+
+        "takeProfit2": take_profit2,
+
+        "confidence": confidence,
+
+        "reasoning": reasoning,
+
+        # XM is deliberately kept separate.
+        "brokerPriceStatus": "UNAVAILABLE",
+
+        "brokerSymbol": None,
+
+        "brokerBid": None,
+
+        "brokerAsk": None,
+
+        "brokerSpread": None,
+    }
+
+
+# ============================================================
+# MARKET FETCH
 # ============================================================
 
 def get_market(symbol):
@@ -202,60 +837,11 @@ def get_market(symbol):
             f"Unsupported market: {symbol}"
         )
 
-    response = requests.get(
-        f"{LUMI_API_URL}/_api/market_intelligence",
-        params={"symbol": symbol},
-        timeout=25,
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if not data or "symbol" not in data:
-        raise ValueError(
-            "Lumi returned no market intelligence."
-        )
-
-    return data
+    return analyze_market(symbol)
 
 
 # ============================================================
-# FORMATTING
-# ============================================================
-
-def money(value):
-
-    if value is None:
-        return "—"
-
-    try:
-        return f"${float(value):,.2f}"
-    except (TypeError, ValueError):
-        return "—"
-
-
-def pct(value):
-
-    if value is None:
-        return "—"
-
-    try:
-        return f"{float(value):+.2f}%"
-    except (TypeError, ValueError):
-        return "—"
-
-
-def safe_number(value, default=0):
-
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-# ============================================================
-# HARD ALERT SAFETY GATE
+# ALERT SAFETY GATE
 # ============================================================
 
 def validated_alert(data):
@@ -272,14 +858,16 @@ def validated_alert(data):
         "INDEPENDENT_UNAVAILABLE",
     )
 
-    confidence = safe_number(
+    confidence = safe_float(
         data.get("confidence"),
         0,
     )
 
-    # Lumi automatic alerts require ALL conditions.
     return (
-        setup in ("BUY_SETUP", "SELL_SETUP")
+        setup in (
+            "BUY_SETUP",
+            "SELL_SETUP",
+        )
         and market_status == "GLOBAL_LIVE"
         and validation == "INDEPENDENT_CONFIRMED"
         and confidence >= MIN_SIGNAL_CONFIDENCE
@@ -287,7 +875,7 @@ def validated_alert(data):
 
 
 # ============================================================
-# FULL MARKET REPORT
+# MARKET REPORT
 # ============================================================
 
 def format_market_report(data):
@@ -299,8 +887,10 @@ def format_market_report(data):
 
     if setup == "BUY_SETUP":
         decision = "BUY"
+
     elif setup == "SELL_SETUP":
         decision = "SELL"
+
     else:
         decision = "NO TRADE"
 
@@ -310,20 +900,17 @@ def format_market_report(data):
 
         "",
 
-        f"💰 Global market price: "
+        f"💰 Market price: "
         f"{money(data.get('price'))}",
 
-        f"🟢 Market data: "
-        f"{data.get('marketDataStatus', 'REFERENCE_ONLY')}",
+        f"📡 Data status: "
+        f"{data.get('marketDataStatus')}",
 
-        f"🌐 Primary source: "
-        f"{data.get('globalSource') or data.get('source') or '—'}",
+        f"🌐 Source: "
+        f"{data.get('globalSource')}",
 
-        f"🔎 Secondary validation: "
-        f"{data.get('priceValidation', 'INDEPENDENT_UNAVAILABLE')}",
-
-        f"📏 Cross-feed deviation: "
-        f"{pct(data.get('priceDeviationPercent'))}",
+        f"🔎 Validation: "
+        f"{data.get('priceValidation')}",
 
         f"⏱ Quote age: "
         f"{data.get('globalFreshnessSeconds', '—')}s",
@@ -336,11 +923,11 @@ def format_market_report(data):
 
         "",
 
-        f"Bias: {data.get('bias', '—')}",
-        f"Trend: {data.get('trend', '—')}",
+        f"Bias: {data.get('bias')}",
+        f"Trend: {data.get('trend')}",
 
         f"RSI 14: "
-        f"{safe_number(data.get('rsi')):.1f}",
+        f"{safe_float(data.get('rsi'), 0):.1f}",
 
         f"Momentum 5h: "
         f"{pct(data.get('momentum5h'))}",
@@ -349,10 +936,7 @@ def format_market_report(data):
         f"{pct(data.get('momentum20h'))}",
 
         f"Regime: "
-        f"{data.get('regime', '—')}",
-
-        f"Timeframe confirmation: "
-        f"{data.get('timeframeConfirmation', '—')}%",
+        f"{data.get('regime')}",
 
         "",
 
@@ -369,7 +953,7 @@ def format_market_report(data):
         f"{money(data.get('resistance'))}",
 
         f"Structure: "
-        f"{data.get('structureBreak', '—')}",
+        f"{data.get('structureBreak')}",
 
         "",
 
@@ -380,27 +964,20 @@ def format_market_report(data):
         "",
 
         f"Decision: {decision}",
+
+        f"Evidence score: "
+        f"{data.get('confidence', 0)}/100",
     ]
 
     if setup != "NO_TRADE":
 
-        entry = data.get("entryPrice")
-        stop = data.get("stopLoss")
-
-        if entry is not None and stop is not None:
-            risk = abs(
-                safe_number(entry)
-                - safe_number(stop)
-            )
-        else:
-            risk = None
-
         lines.extend(
             [
-                f"Entry: {money(entry)}",
+                f"Entry: "
+                f"{money(data.get('entryPrice'))}",
 
                 f"Stop Loss: "
-                f"{money(stop)}",
+                f"{money(data.get('stopLoss'))}",
 
                 f"TP1: "
                 f"{money(data.get('takeProfit1'))}",
@@ -408,29 +985,21 @@ def format_market_report(data):
                 f"TP2: "
                 f"{money(data.get('takeProfit2'))}",
 
-                f"Risk distance: "
-                f"{money(risk)}",
-
                 "TP1 R:R: 1:1.5",
                 "TP2 R:R: 1:2.5",
-
-                f"Evidence score: "
-                f"{data.get('confidence', 0)}/100",
             ]
         )
 
     else:
 
-        lines.extend(
-            [
-                f"Evidence score: "
-                f"{data.get('confidence', 0)}/100",
-
-                "No executable setup is currently validated.",
-            ]
+        lines.append(
+            "No executable setup is currently validated."
         )
 
-    reasoning = data.get("reasoning") or []
+    reasoning = data.get(
+        "reasoning",
+        [],
+    )
 
     if reasoning:
 
@@ -442,46 +1011,27 @@ def format_market_report(data):
         )
 
         for item in reasoning[:8]:
-            lines.append(f"• {item}")
-
-    # XM stays separate from Lumi's global intelligence.
-    lines.extend(
-        [
-            "",
-            "━━━━━━━━━━━━━━━━━━",
-            "⚙️ EXECUTION CHECK",
-            "━━━━━━━━━━━━━━━━━━",
-
-            "",
-
-            f"XM status: "
-            f"{data.get('brokerPriceStatus', 'UNAVAILABLE')}",
-
-            f"XM symbol: "
-            f"{data.get('brokerSymbol') or '—'}",
-
-            f"XM bid: "
-            f"{money(data.get('brokerBid'))}",
-
-            f"XM ask: "
-            f"{money(data.get('brokerAsk'))}",
-
-            f"XM spread: "
-            f"{money(data.get('brokerSpread'))}",
-        ]
-    )
+            lines.append(
+                f"• {item}"
+            )
 
     lines.extend(
         [
             "",
-            "⚠️ Automated market intelligence, "
-            "not guaranteed financial advice.",
+            "━━━━━━━━━━━━━━━━━━",
+            "🛡 SAFETY",
+            "━━━━━━━━━━━━━━━━━━",
 
-            "Evidence score measures indicator "
-            "agreement, not probability of profit.",
+            "",
 
-            "Verify the executable broker price "
-            "before acting.",
+            "Independent confirmation: NOT AVAILABLE",
+
+            "Automatic trade alerts: BLOCKED",
+
+            "",
+            "⚠️ Market intelligence only.",
+            "Not guaranteed financial advice.",
+            "Verify executable broker pricing before acting.",
         ]
     )
 
@@ -489,7 +1039,7 @@ def format_market_report(data):
 
 
 # ============================================================
-# TELEGRAM TRADE ALERT
+# TRADE ALERT
 # ============================================================
 
 def format_trade_alert(data):
@@ -500,109 +1050,30 @@ def format_trade_alert(data):
         else "SELL"
     )
 
-    icon = "🟢" if side == "BUY" else "🔴"
+    icon = (
+        "🟢"
+        if side == "BUY"
+        else "🔴"
+    )
 
-    lines = [
-
-        "🚨 LUMI TRADE ALERT",
-
-        "",
-
-        f"🟡 {data.get('symbol', 'MARKET')}",
-
-        f"{icon} {side} SETUP VALIDATED",
-
-        "",
-
-        f"💰 Global price: "
-        f"{money(data.get('price'))}",
-
-        f"🎯 Entry: "
-        f"{money(data.get('entryPrice'))}",
-
-        f"🛑 Stop Loss: "
-        f"{money(data.get('stopLoss'))}",
-
-        f"💰 TP1: "
-        f"{money(data.get('takeProfit1'))}",
-
-        f"💰 TP2: "
-        f"{money(data.get('takeProfit2'))}",
-
-        "",
-
-        "📊 ANALYSIS",
-
-        f"Evidence score: "
-        f"{data.get('confidence', 0)}/100",
-
-        f"Bias: "
-        f"{data.get('bias', '—')}",
-
-        f"Trend: "
-        f"{data.get('trend', '—')}",
-
-        f"RSI: "
-        f"{safe_number(data.get('rsi')):.1f}",
-
-        f"Momentum 5h: "
-        f"{pct(data.get('momentum5h'))}",
-
-        f"Momentum 20h: "
-        f"{pct(data.get('momentum20h'))}",
-
-        f"Support: "
-        f"{money(data.get('support'))}",
-
-        f"Resistance: "
-        f"{money(data.get('resistance'))}",
-
-        f"Regime: "
-        f"{data.get('regime', '—')}",
-
-        f"MTF confirmation: "
-        f"{data.get('timeframeConfirmation', '—')}%",
-
-        "",
-
-        "🛡 VALIDATION",
-
-        f"Global data: "
-        f"{data.get('marketDataStatus')}",
-
-        f"Secondary feed: "
-        f"{data.get('priceValidation')}",
-
-        f"Cross-feed deviation: "
-        f"{pct(data.get('priceDeviationPercent'))}",
-
-        f"Quote age: "
-        f"{data.get('globalFreshnessSeconds', '—')}s",
-
-        "",
-
-        "⚙️ EXECUTION CHECK",
-
-        f"XM status: "
-        f"{data.get('brokerPriceStatus', 'UNAVAILABLE')}",
-
-        f"XM bid: "
-        f"{money(data.get('brokerBid'))}",
-
-        f"XM ask: "
-        f"{money(data.get('brokerAsk'))}",
-
-        f"XM spread: "
-        f"{money(data.get('brokerSpread'))}",
-
-        "",
-
-        "⚠️ Validated market-intelligence alert.",
-        "This is not a guaranteed trade outcome.",
-        "Verify executable broker pricing and risk before acting.",
-    ]
-
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            "🚨 LUMI TRADE ALERT",
+            "",
+            f"🟡 {data.get('symbol')}",
+            f"{icon} {side} SETUP VALIDATED",
+            "",
+            f"Entry: {money(data.get('entryPrice'))}",
+            f"Stop Loss: {money(data.get('stopLoss'))}",
+            f"TP1: {money(data.get('takeProfit1'))}",
+            f"TP2: {money(data.get('takeProfit2'))}",
+            "",
+            f"Evidence score: "
+            f"{data.get('confidence')}/100",
+            "",
+            "⚠️ Verify broker pricing and risk before acting.",
+        ]
+    )
 
 
 # ============================================================
@@ -643,7 +1114,7 @@ async def send_alert(
 
 
 # ============================================================
-# AUTOMATIC MARKET MONITOR
+# AUTOMATIC MONITOR
 # ============================================================
 
 async def market_monitor(
@@ -661,7 +1132,6 @@ async def market_monitor(
 
             data = get_market(symbol)
 
-            # Never alert on an invalid/stale/reference-only setup.
             if not validated_alert(data):
                 continue
 
@@ -678,10 +1148,7 @@ async def market_monitor(
                 except Exception:
 
                     logger.exception(
-                        "Telegram alert delivery failed "
-                        "for %s / %s",
-                        symbol,
-                        chat_id,
+                        "Telegram alert failed."
                     )
 
         except Exception:
@@ -707,14 +1174,14 @@ async def start(
 
     await update.message.reply_text(
 
-        "🤖 LUMI AI\n\n"
+        "🤖 LUMI AI 2.0\n\n"
 
-        "Global-market intelligence is online.\n\n"
+        "Market intelligence engine is online.\n\n"
 
-        "🚨 Telegram is Lumi's alert channel.\n"
-        "📡 Monitoring 14 supported markets.\n"
-        "🛡 Alerts require GLOBAL_LIVE + "
-        "independent confirmation.\n\n"
+        "📡 Monitoring 14 markets.\n"
+        "🧠 Technical analysis active.\n"
+        "🛡 Safety gate active.\n"
+        "🚨 Alerts require independent confirmation.\n\n"
 
         "Use /help for commands."
     )
@@ -731,41 +1198,25 @@ async def help_command(
 
     await update.message.reply_text(
 
-        "🤖 LUMI COMMAND CENTER\n\n"
+        "🤖 LUMI AI 2.0\n\n"
 
         "MARKETS\n"
         "/gold — XAUUSD\n"
-        "/market SYMBOL — any supported market\n\n"
-
-        "SUPPORTED MARKETS\n"
-        "XAUUSD\n"
-        "BTCUSD\n"
-        "ETHUSD\n"
-        "SPX500\n"
-        "NAS100\n"
-        "DJ30\n"
-        "GER40\n"
-        "UK100\n"
-        "JP225\n"
-        "EURUSD\n"
-        "GBPUSD\n"
-        "USDJPY\n"
-        "AUDUSD\n"
-        "USDCAD\n\n"
+        "/market SYMBOL\n\n"
 
         "SIGNALS\n"
-        "/signal — current validated setup\n"
-        "/signal NAS100\n"
-        "/signal XAUUSD\n\n"
+        "/signal\n"
+        "/signal XAUUSD\n"
+        "/signal NAS100\n\n"
 
         "ALERTS\n"
-        "/alerts — alert status\n"
-        "/alerts on — enable alerts\n"
-        "/alerts off — disable alerts\n\n"
+        "/alerts\n"
+        "/alerts on\n"
+        "/alerts off\n\n"
 
         "SYSTEM\n"
-        "/status — Lumi system status\n"
-        "/help — commands"
+        "/status\n"
+        "/help"
     )
 
 
@@ -792,15 +1243,14 @@ async def market_command(
 
         await update.message.reply_text(
             "⚠️ Unsupported market.\n\n"
-            "Use /help to see Lumi's "
-            "supported symbols."
+            "Use /help to see supported markets."
         )
 
         return
 
     await update.message.reply_text(
-        f"🧠 Lumi is validating {symbol} "
-        "using global market data..."
+        f"🧠 Lumi is analysing {symbol} "
+        "using direct market data..."
     )
 
     try:
@@ -814,7 +1264,7 @@ async def market_command(
     except Exception as error:
 
         logger.exception(
-            "Market analysis failed"
+            "Market analysis failed."
         )
 
         await update.message.reply_text(
@@ -897,16 +1347,15 @@ async def alerts_command(
 
         await update.message.reply_text(
 
-            "🚨 LUMI TELEGRAM ALERTS: ON\n\n"
+            "🚨 LUMI ALERTS: ON\n\n"
 
-            "Lumi will monitor all supported "
-            "markets every 5 minutes.\n\n"
+            "Lumi will monitor the supported markets.\n\n"
 
-            "Alerts require:\n"
-            "• Global data LIVE\n"
+            "Automatic alerts still require:\n"
+            "• Global live data\n"
             "• Independent confirmation\n"
             "• Evidence score ≥ 80\n"
-            "• No divergence warning"
+            "• No validation failure"
         )
 
         return
@@ -919,7 +1368,7 @@ async def alerts_command(
         )
 
         await update.message.reply_text(
-            "🔕 LUMI TELEGRAM ALERTS: OFF"
+            "🔕 LUMI ALERTS: OFF"
         )
 
         return
@@ -932,20 +1381,14 @@ async def alerts_command(
 
     await update.message.reply_text(
 
-        "🚨 LUMI TELEGRAM ALERT STATUS\n\n"
+        "🚨 LUMI ALERT STATUS\n\n"
 
         f"Automatic alerts: {status}\n"
+        f"Markets monitored: {len(MARKETS)}\n"
+        f"Check interval: {MONITOR_INTERVAL // 60} minutes\n"
+        f"Cooldown: {ALERT_COOLDOWN_SECONDS // 60} minutes\n\n"
 
-        f"Markets monitored: "
-        f"{len(MARKETS)}\n"
-
-        f"Check interval: "
-        f"{MONITOR_INTERVAL // 60} minutes\n"
-
-        f"Duplicate cooldown: "
-        f"{ALERT_COOLDOWN_SECONDS // 60} minutes\n\n"
-
-        "ALERT GATE\n"
+        "Alert gate:\n"
         "GLOBAL_LIVE\n"
         "+ INDEPENDENT_CONFIRMED\n"
         f"+ SCORE ≥ {MIN_SIGNAL_CONFIDENCE}"
@@ -967,35 +1410,27 @@ async def status_command(
 
     await update.message.reply_text(
 
-        "🟢 LUMI SYSTEM STATUS\n\n"
+        "🟢 LUMI AI 2.0 STATUS\n\n"
 
-        "Telegram Connection: Active\n"
-        "Global Market Intelligence: Active\n"
-        "Independent Validation: Active\n"
-        "Signal Safety Gate: Active\n\n"
+        "Telegram: ACTIVE\n"
+        "Market Engine: ACTIVE\n"
+        "Direct Market Source: ACTIVE\n"
+        "Independent Validation: NOT CONNECTED\n"
+        "Signal Safety Gate: ACTIVE\n\n"
 
-        f"Supported Markets: "
-        f"{len(MARKETS)}\n"
+        f"Supported Markets: {len(MARKETS)}\n"
+        f"Monitoring: {MONITOR_INTERVAL // 60} minutes\n"
+        f"Minimum Evidence: {MIN_SIGNAL_CONFIDENCE}/100\n\n"
 
-        f"Monitoring Interval: "
-        f"{MONITOR_INTERVAL // 60} minutes\n"
+        "Automatic trade execution: OFF\n"
+        "Automatic alerts: BLOCKED until independent confirmation.\n\n"
 
-        f"Minimum Evidence Score: "
-        f"{MIN_SIGNAL_CONFIDENCE}/100\n\n"
-
-        "ALERT RULES\n"
-        "• Global market data must be LIVE\n"
-        "• Secondary feed must confirm\n"
-        "• Divergence blocks alerts\n"
-        "• Stale data blocks alerts\n"
-        "• Reference-only data blocks alerts\n"
-        "• XM is optional execution validation\n"
-        "• No automatic trade execution"
+        "No signal will be invented."
     )
 
 
 # ============================================================
-# NATURAL LANGUAGE MESSAGES
+# NATURAL LANGUAGE
 # ============================================================
 
 async def handle_message(
@@ -1058,7 +1493,9 @@ async def handle_message(
         return
 
     await update.message.reply_text(
-        "🤖 Lumi is online.\n\n"
+
+        "🤖 Lumi AI 2.0 is online.\n\n"
+
         "Try:\n"
         "/gold\n"
         "/market XAUUSD\n"
@@ -1071,7 +1508,7 @@ async def handle_message(
 
 
 # ============================================================
-# STARTUP / JOB QUEUE
+# STARTUP
 # ============================================================
 
 async def post_init(
@@ -1097,7 +1534,7 @@ async def post_init(
 
         first=10,
 
-        name="global_market_monitor",
+        name="lumi_market_monitor",
     )
 
 
@@ -1179,7 +1616,7 @@ def main():
     )
 
     logger.info(
-        "Lumi AI starting with global market intelligence."
+        "Lumi AI 2.0 starting."
     )
 
     application.run_polling()
